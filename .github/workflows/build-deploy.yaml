@@ -1,0 +1,1587 @@
+name: Reusable build, bump, and deploy
+
+on:
+  workflow_call:
+    inputs:
+      # ─── identity ────────────────────────────────────────────────────────────
+      team:
+        description: "Tenant name. Maps to the folder under `argocd-workloads/charts/<team>/` and to the ArgoCD AppProject `tenant-<team>`."
+        type: string
+        required: false
+        default: "ecosystem"
+      app:
+        description: "Application/chart name. Maps to the folder `argocd-workloads/charts/<team>/<app>/`."
+        type: string
+        required: true
+      component:
+        description: "Component identifier. Drives: (1) which `.components.<component>` key in chart values gets bumped, (2) image registry suffix (`-<component>` when non-main), (3) Vault KV sub-path, (4) `workflow_dispatch` input name (`deploy_<component>`, or just `deploy` when main)."
+        type: string
+        default: "main"
+      init_containers:
+        description: "Multiline list of initContainer names whose image (repository + tag) should be bumped to the same value as the main container."
+        type: string
+        default: ""
+      extra_components:
+        description: "Multiline list of additional chart component keys that share this build's image. For each, bump `.components.<extra>.containers.main.image.{repository,tag}` to the same value as the primary component, plus the same `init_containers` names where they exist. Runtime Vault paths are also auto-created per extra. Build, push, ArgoCD discover, sync, release, and cleanup remain scoped to the primary component."
+        type: string
+        default: ""
+
+      # ─── build ───────────────────────────────────────────────────────────────
+      dockerfile:
+        description: "Path to the Dockerfile, relative to `context`."
+        type: string
+        default: "Dockerfile"
+      context:
+        description: "Docker build context path."
+        type: string
+        default: "."
+      registry:
+        description: "Container registry path (no tag). Empty = `ghcr.io/<repo>` for component=main, `ghcr.io/<repo>-<component>` otherwise."
+        type: string
+        default: ""
+      registry_username:
+        description: "Registry login username. Empty = `github.actor`."
+        type: string
+        default: ""
+      build_args:
+        description: "Multiline KEY=VALUE pairs resolved on the caller side. Use only for values that don't change per environment (e.g. BUILD_SHA from github.sha). Environment-specific args come from Vault when configured."
+        type: string
+        default: ""
+
+      vault_server:
+        description: "Vault address (e.g. `https://vault.example.domain`). When set, build job fetches per-env build-args from KV-v2 mount `gh-actions/` via GitHub OIDC → JWT auth. Auto-masked. Empty = Vault disabled."
+        type: string
+        default: ""
+      vault_auth_path:
+        description: "Vault JWT auth mount path. Default matches `vault auth enable -path=gh-actions jwt` from bootstrap."
+        type: string
+        default: "gh-actions"
+      vault_role:
+        description: "Vault JWT role name. Default matches org-wide role from bootstrap."
+        type: string
+        default: "default"
+      vault_audience:
+        description: "OIDC `aud` claim sent with the JWT. Empty = auto `https://github.com/<repository_owner>` (matches GitHub's default `aud` and the `bound_audiences` set in the bootstrap)."
+        type: string
+        default: ""
+      vault_path:
+        description: "Override Vault KV path. Empty = `gh-actions/data/<team>/<app>/<env>` for `component=main`, else `gh-actions/data/<team>/<app>/<component>/<env>`."
+        type: string
+        default: ""
+      cache:
+        description: "Enable GitHub Actions cache backend for buildx layer cache (`type=gha`). Speeds up rebuilds at the cost of GHA cache storage."
+        type: boolean
+        default: false
+      image_tag:
+        description: "Override the primary image tag. Empty = tag name on git-tag pushes, `<UTC-ts>_<branch>_<sha>` on branch pushes."
+        type: string
+        default: ""
+      additional_tags:
+        description: "Multiline list of extra tags pushed alongside the primary tag (e.g. a version alias). Each line becomes `${registry}:${tag}` in the push."
+        type: string
+        default: ""
+      release_prefix:
+        description: "Scope for monorepo releases (e.g. `poker` in a `dapps` monorepo). Auto-derived when omitted: equals `<app>` if `app` is NOT a substring of the repo name (monorepo shape), empty otherwise (tenant-specific repo — components share coordinated releases). When set: (1) `registry` defaults to `ghcr.io/<repo>` (no `-<component>` suffix), (2) `prod_tag_prefix` defaults to `<release_prefix>-v`, (3) `prod_tag_pattern` to `^<release_prefix>-v<semver>$`, (4) tag pushes that don't start with `<release_prefix>-` are skipped, (5) GHCR cleanup is scoped to `<release_prefix>-*` tags only. Explicit `registry`/`prod_tag_prefix`/`prod_tag_pattern` still override the derived defaults. NOTE: this does NOT prefix the docker image tag — set `prefix_tag: true` for that (shared-registry monorepos)."
+        type: string
+        default: ""
+      prefix_tag:
+        description: "Prefix the docker image tag with the release_prefix (auto-derived `<app>`, or explicit `release_prefix`): `<prefix>-<UTC>_<branch>_<sha>` and `<prefix>-latest`. ONLY needed for shared-registry monorepos where several apps push to the SAME `ghcr.io/<repo>` image (e.g. `dapps`: poker, battleship, … share one image and must be namespaced by tag). Default false → clean tag `<UTC>_<branch>_<sha>` everywhere else (single-app repos and per-component registries don't collide, so they stay clean without repeating the app name)."
+        type: boolean
+        default: false
+      create_release:
+        description: "Create a GitHub Release when the push is a git tag matching `prod_tag_prefix`."
+        type: boolean
+        default: true
+      latest_tag_branch:
+        description: "Comma-separated branches whose builds also receive a `:latest` tag (non-tag pushes only). Empty = disabled."
+        type: string
+        default: "main,master"
+
+      # ─── cleanup ─────────────────────────────────────────────────────────────
+      cleanup_enabled:
+        description: "Opt in to deleting old image versions from GHCR after a successful build. Protected from deletion: tags starting with `prod_tag_prefix`, `latest`, and any line from `additional_tags`."
+        type: boolean
+        default: false
+      cleanup_keep:
+        description: "How many most-recent non-protected image versions to keep when cleanup runs."
+        type: number
+        default: 3
+      cleanup_dry_run:
+        description: "Log what would be deleted without performing the deletion. Useful when first enabling cleanup."
+        type: boolean
+        default: false
+
+      # ─── environment routing ─────────────────────────────────────────────────
+      env:
+        description: "Override deployment env. Empty = derived from branch/tag"
+        type: string
+        default: ""
+      prod_tag_prefix:
+        description: "Tag name prefix that promotes to prod_env (e.g. `v` matches v1.2.3). Empty = no tag promotion"
+        type: string
+        default: "v"
+      prod_tag_pattern:
+        description: "ERE regex to validate prod tag names. Default = strict semver with `v` prefix (e.g. `v1.2.3`, `v2.0.0-rc1`, `v1.0.0+meta`). Override for custom versioning (e.g. `^[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}$` for date-based). Empty = no validation."
+        type: string
+        default: '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+      prod_branch:
+        description: "Comma-separated branches that promote to prod_env. Default: empty — prod only via tag"
+        type: string
+        default: ""
+      prod_env:
+        description: "Env name for prod releases (used in ArgoCD app lookup, chart values path, Vault KV path)"
+        type: string
+        default: "prod"
+      dev_branch:
+        description: "Comma-separated branches that go to dev_env. Empty = no dev category"
+        type: string
+        default: ""
+      dev_env:
+        description: "Env name for dev_branch matches"
+        type: string
+        default: "dev"
+      default_env:
+        description: "Env name for everything else (main, feature/*, etc.)"
+        type: string
+        default: "stg"
+
+      # ─── bump ────────────────────────────────────────────────────────────────
+      values_path:
+        description: "Which values file to bump, relative to `charts/<team>/<app>/`. Empty = `values/<env>.yaml` if exists else `values.yaml`"
+        type: string
+        default: ""
+
+      # ─── argocd sync ─────────────────────────────────────────────────────────
+      argocd_server:
+        description: "ArgoCD server hostname (no scheme, no path). Empty = skip ArgoCD interaction entirely (no app discovery, no sync wait); `bump` still runs to update chart values."
+        type: string
+        default: ""
+      argocd_app:
+        description: "Explicit single Application name to sync. Empty = discover Applications by labels `app=<app>,env=<env>,team=<team>` via the ArgoCD API."
+        type: string
+        default: ""
+      argocd_grpc_web:
+        description: "Add `--grpc-web` to the argocd CLI. Required when ArgoCD is behind an HTTP/2-incompatible proxy (e.g. some ingress controllers)."
+        type: boolean
+        default: true
+      argocd_timeout:
+        description: "Maximum seconds to wait per Application for both sync and health to become OK."
+        type: number
+        default: 600
+
+      # ─── change filter ───────────────────────────────────────────────────────
+      paths_filter:
+        description: "Multiline list of glob patterns (one per line, e.g. `backend/**`). Build runs only if at least one changed file matches a pattern. Tag pushes, `workflow_dispatch`, and force-pushes always proceed regardless of the filter."
+        type: string
+        default: ""
+
+      # ─── runner ──────────────────────────────────────────────────────────────
+      runs_on:
+        description: "Runner label or self-hosted runner group for every job in this workflow."
+        type: string
+        default: "ubuntu-latest"
+
+    secrets:
+      WORKLOADS_REPO_TOKEN:
+        required: true
+        description: "PAT with `contents:write` on `gear-ops/argocd-workloads`. Used to push chart bump commits."
+      REGISTRY_PASSWORD:
+        required: false
+        description: "Used only for non-ghcr registries. ghcr.io falls back to `GITHUB_TOKEN`."
+      TELEGRAM_TOKEN:
+        required: false
+        description: "Bot token used to send failure notifications. Empty disables the notify job."
+      TELEGRAM_CHAT:
+        required: false
+        description: "Target chat ID for failure notifications."
+      TELEGRAM_THREAD:
+        required: false
+        description: "Forum topic ID inside `TELEGRAM_CHAT` (when chat is a supergroup with topics)."
+      ARGOCD_TOKEN:
+        required: false
+        description: "ArgoCD API token (Settings → Accounts → Generate token). Required when `argocd_server` is set."
+      VAULT_TOKEN_STATIC:
+        required: false
+        description: "Long-lived Vault token (skip OIDC)."
+
+jobs:
+  changes:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    outputs:
+      matched: ${{ steps.skip.outputs.matched || steps.diff.outputs.matched }}
+      detail: ${{ steps.skip.outputs.detail || steps.diff.outputs.detail }}
+    steps:
+      - name: Evaluate skip conditions
+        id: skip
+        env:
+          FILTER: ${{ inputs.paths_filter }}
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          IN_APP: ${{ inputs.app }}
+          IN_COMPONENT: ${{ inputs.component }}
+          RELEASE_PFX: ${{ inputs.release_prefix }}
+          FORCED: ${{ github.event.forced }}
+          DISPATCH_FLAG: ${{ github.event.inputs[inputs.component == 'main' && 'deploy' || format('deploy_{0}', inputs.component)] }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == "workflow_dispatch" && "$DISPATCH_FLAG" == "false" ]]; then
+            echo "▸ manual dispatch unchecked deploy_${{ inputs.component }} — skipping component"
+            echo "matched=false" >> "$GITHUB_OUTPUT"
+            echo "detail=manual dispatch with deploy_${{ inputs.component }}=false" >> "$GITHUB_OUTPUT"
+            echo "skip_diff=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Auto-derive release_prefix when not explicitly set (mirror logic in build/ctx).
+          if [[ -z "$RELEASE_PFX" ]]; then
+            repo_name="${REPO#*/}"
+            if [[ "$repo_name" != *"$IN_APP"* ]]; then
+              RELEASE_PFX="$IN_APP"
+            fi
+          fi
+          if [[ "$REF_TYPE" == "tag" && -n "$RELEASE_PFX" && "$REF_NAME" != "${RELEASE_PFX}-"* ]]; then
+            echo "▸ tag '${REF_NAME}' does not start with release_prefix '${RELEASE_PFX}-' — skipping component"
+            echo "matched=false" >> "$GITHUB_OUTPUT"
+            echo "detail=tag mismatch for release_prefix='${RELEASE_PFX}'" >> "$GITHUB_OUTPUT"
+            echo "skip_diff=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ -z "$FILTER" ]]; then
+            echo "matched=true" >> "$GITHUB_OUTPUT"
+            echo "detail=no paths_filter configured" >> "$GITHUB_OUTPUT"
+            echo "skip_diff=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$REF_TYPE" == "tag" ]]; then
+            echo "matched=true" >> "$GITHUB_OUTPUT"
+            echo "detail=git tag push (filter bypass)" >> "$GITHUB_OUTPUT"
+            echo "skip_diff=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$EVENT" == "workflow_dispatch" ]]; then
+            echo "matched=true" >> "$GITHUB_OUTPUT"
+            echo "detail=manual dispatch (filter bypass)" >> "$GITHUB_OUTPUT"
+            echo "skip_diff=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$FORCED" == "true" ]]; then
+            echo "matched=true" >> "$GITHUB_OUTPUT"
+            echo "detail=force push (filter bypass)" >> "$GITHUB_OUTPUT"
+            echo "skip_diff=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout source
+        if: steps.skip.outputs.skip_diff != 'true'
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Compute changed files diff
+        id: diff
+        if: steps.skip.outputs.skip_diff != 'true'
+        env:
+          FILTER: ${{ inputs.paths_filter }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${BEFORE:-}" && "$BEFORE" != "0000000000000000000000000000000000000000" ]] \
+             && git rev-parse --verify "${BEFORE}^{commit}" >/dev/null 2>&1; then
+            base="$BEFORE"
+          else
+            base="HEAD~1"
+          fi
+          echo "▸ diff base: $base..HEAD ($(git rev-parse "$base") → $(git rev-parse HEAD))"
+
+          mapfile -t FILES < <(git diff --name-only "$base" HEAD)
+          echo "▸ files in diff: ${#FILES[@]}"
+          for f in "${FILES[@]:-}"; do
+            [[ -n "$f" ]] && echo "  — $f"
+          done
+
+          matched=false
+          while IFS= read -r pat; do
+            pat="${pat#"${pat%%[![:space:]]*}"}"
+            pat="${pat%"${pat##*[![:space:]]}"}"
+            [[ -z "$pat" ]] && continue
+            for f in "${FILES[@]:-}"; do
+              [[ -z "$f" ]] && continue
+              case "$f" in
+                $pat) matched=true; break 2 ;;
+              esac
+            done
+          done <<< "$FILTER"
+          echo "matched=$matched" >> "$GITHUB_OUTPUT"
+
+          if [[ "$matched" == "true" ]]; then
+            echo "detail=${#FILES[@]} files matched paths_filter" >> "$GITHUB_OUTPUT"
+          else
+            echo "detail=${#FILES[@]} files changed, none matched paths_filter" >> "$GITHUB_OUTPUT"
+          fi
+
+  context:
+    needs: changes
+    if: ${{ needs.changes.outputs.matched == 'true' }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      env: ${{ steps.ctx.outputs.env }}
+      registry: ${{ steps.ctx.outputs.registry }}
+      tag: ${{ steps.ctx.outputs.tag }}
+      image_name: ${{ steps.ctx.outputs.image_name }}
+      tags: ${{ steps.ctx.outputs.tags }}
+      prod_tag_prefix: ${{ steps.ctx.outputs.prod_tag_prefix }}
+      release_prefix: ${{ steps.ctx.outputs.release_prefix }}
+      extra_latest: ${{ steps.ctx.outputs.extra_latest }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Resolve build context
+        id: ctx
+        env:
+          IN_ENV: ${{ inputs.env }}
+          IN_TAG: ${{ inputs.image_tag }}
+          IN_REG: ${{ inputs.registry }}
+          IN_APP: ${{ inputs.app }}
+          IN_COMPONENT: ${{ inputs.component }}
+          IN_TAGS: ${{ inputs.additional_tags }}
+          IN_LATEST_BR: ${{ inputs.latest_tag_branch }}
+          IN_TAG_PFX: ${{ inputs.prod_tag_prefix }}
+          IN_TAG_RE: ${{ inputs.prod_tag_pattern }}
+          IN_RELEASE_PFX: ${{ inputs.release_prefix }}
+          IN_PREFIX_TAG: ${{ inputs.prefix_tag }}
+          IN_PB: ${{ inputs.prod_branch }}
+          IN_DB: ${{ inputs.dev_branch }}
+          IN_PROD_ENV: ${{ inputs.prod_env }}
+          IN_DEV_ENV: ${{ inputs.dev_env }}
+          IN_DEFAULT_ENV: ${{ inputs.default_env }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          sanitize() { printf '%s' "$1" | tr -c '[:alnum:]_.-' '-' | tr -s '-'; }
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+
+          IN_ENV=$(strip "$IN_ENV")
+          IN_TAG=$(strip "$IN_TAG")
+          IN_REG=$(strip "$IN_REG")
+          IN_APP=$(strip "$IN_APP")
+          IN_COMPONENT=$(strip "$IN_COMPONENT")
+          IN_TAG_PFX=$(strip "$IN_TAG_PFX")
+          IN_RELEASE_PFX=$(strip "$IN_RELEASE_PFX")
+          IN_PROD_ENV=$(strip "$IN_PROD_ENV")
+          IN_DEV_ENV=$(strip "$IN_DEV_ENV")
+          IN_DEFAULT_ENV=$(strip "$IN_DEFAULT_ENV")
+
+          if [[ -z "$IN_RELEASE_PFX" ]]; then
+            repo_name="${REPO#*/}"
+            if [[ "$repo_name" != *"$IN_APP"* ]]; then
+              IN_RELEASE_PFX="$IN_APP"
+            fi
+          fi
+
+          if [[ -n "$IN_RELEASE_PFX" ]]; then
+            [[ "$IN_TAG_PFX" == "v" ]] && IN_TAG_PFX="${IN_RELEASE_PFX}-v"
+            [[ "$IN_TAG_RE" == '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' ]] \
+              && IN_TAG_RE="^${IN_RELEASE_PFX}-v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$"
+          fi
+
+          if [[ -n "$IN_TAG" ]]; then
+            tag=$(sanitize "$IN_TAG")
+          elif [[ "$REF_TYPE" == "tag" ]]; then
+            tag=$(sanitize "$REF_NAME")
+          else
+            ts=$(date -u +'%Y.%m.%d_%H.%M')
+            sha=$(git rev-parse --short HEAD)
+            tag="${ts}_$(sanitize "$REF_NAME")_${sha}"
+            [[ "$IN_PREFIX_TAG" == "true" && -n "$IN_RELEASE_PFX" ]] && tag="${IN_RELEASE_PFX}-${tag}"
+          fi
+
+          if [[ "$REF_TYPE" == "tag" && -n "$IN_TAG_PFX" && "$REF_NAME" == "$IN_TAG_PFX"* && -n "${IN_TAG_RE:-}" ]]; then
+            if ! [[ "$REF_NAME" =~ $IN_TAG_RE ]]; then
+              echo "::error::Tag '${REF_NAME}' starts with prod_tag_prefix '${IN_TAG_PFX}' but does not match prod_tag_pattern regex: ${IN_TAG_RE}"
+              exit 1
+            fi
+            echo "▸ tag '${REF_NAME}' matches prod_tag_pattern '${IN_TAG_RE}'"
+          fi
+
+          envn="$IN_ENV"
+          if [[ -z "$envn" ]]; then
+            in_csv() {
+              local csv="$1" needle="$REF_NAME"
+              IFS=',' read -ra arr <<< "$csv"
+              for b in "${arr[@]}"; do
+                b="${b//[[:space:]]/}"; [[ -z "$b" ]] && continue
+                [[ "$needle" == "$b" ]] && return 0
+              done
+              return 1
+            }
+            if   [[ "$REF_TYPE" == "tag" && -n "$IN_TAG_PFX" && "$REF_NAME" == "$IN_TAG_PFX"* ]]; then envn="$IN_PROD_ENV"
+            elif [[ -n "$IN_PB" ]] && in_csv "$IN_PB"; then envn="$IN_PROD_ENV"
+            elif [[ -n "$IN_DB" ]] && in_csv "$IN_DB"; then envn="$IN_DEV_ENV"
+            else envn="$IN_DEFAULT_ENV"
+            fi
+          fi
+
+          reg="$IN_REG"
+          if [[ -z "$reg" ]]; then
+            reg="ghcr.io/$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
+            [[ -z "$IN_RELEASE_PFX" && "$IN_COMPONENT" != "main" ]] && reg="${reg}-${IN_COMPONENT}"
+          fi
+
+          image_name="${reg}:${tag}"
+
+          extra_latest=""
+          if [[ "$REF_TYPE" == "branch" && -n "$IN_LATEST_BR" ]]; then
+            IFS=',' read -ra _lb <<< "$IN_LATEST_BR"
+            for b in "${_lb[@]}"; do
+              b="${b//[[:space:]]/}"; [[ -z "$b" ]] && continue
+              [[ "$REF_NAME" == "$b" ]] && {
+                extra_latest="latest"
+                [[ "$IN_PREFIX_TAG" == "true" && -n "$IN_RELEASE_PFX" ]] && extra_latest="${IN_RELEASE_PFX}-latest"
+                break
+              }
+            done
+          fi
+
+          {
+            echo "tags<<__EOF__"
+            echo "$image_name"
+            if [[ -n "$IN_TAGS" ]]; then
+              while IFS= read -r t; do
+                t=$(sanitize "$t"); [[ -z "$t" ]] && continue
+                [[ "$IN_PREFIX_TAG" == "true" && -n "$IN_RELEASE_PFX" ]] && t="${IN_RELEASE_PFX}-${t}"
+                echo "${reg}:${t}"
+              done <<< "$IN_TAGS"
+            fi
+            [[ -n "$extra_latest" ]] && echo "${reg}:${extra_latest}"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "env=$envn"
+            echo "registry=$reg"
+            echo "tag=$tag"
+            echo "image_name=$image_name"
+            echo "prod_tag_prefix=$IN_TAG_PFX"
+            echo "release_prefix=$IN_RELEASE_PFX"
+            echo "extra_latest=$extra_latest"
+          } >> "$GITHUB_OUTPUT"
+
+  precheck:
+    needs: context
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 3
+    outputs:
+      apps: ${{ steps.apps.outputs.apps }}
+      count: ${{ steps.apps.outputs.count }}
+      selector: ${{ steps.apps.outputs.selector }}
+      deploy_enabled: ${{ steps.apps.outputs.deploy_enabled }}
+    steps:
+      - name: Discover ArgoCD applications (pre-build deploy gate)
+        id: apps
+        env:
+          ARGOCD_SERVER: ${{ inputs.argocd_server }}
+          ARGOCD_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+          APP_OVERRIDE: ${{ inputs.argocd_app }}
+          APP_NAME: ${{ inputs.app }}
+          TEAM: ${{ inputs.team }}
+          ENV: ${{ needs.context.outputs.env }}
+        run: |
+          set -euo pipefail
+
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          ARGOCD_SERVER=$(strip "$ARGOCD_SERVER")
+          ARGOCD_TOKEN=$(strip "$ARGOCD_TOKEN")
+          APP_OVERRIDE=$(strip "$APP_OVERRIDE")
+          APP_NAME=$(strip "$APP_NAME")
+          TEAM=$(strip "$TEAM")
+          ENV=$(strip "$ENV")
+
+          selector="app=${APP_NAME},env=${ENV},team=${TEAM}"
+          echo "selector=$selector" >> "$GITHUB_OUTPUT"
+
+          emit() {
+            # emit <deploy_enabled> <count> [app-lines...]
+            {
+              echo "deploy_enabled=$1"
+              echo "count=$2"
+              echo "apps<<__EOF__"
+              [[ -n "${3:-}" ]] && printf '%s\n' "$3"
+              echo "__EOF__"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          if [[ -z "$ARGOCD_SERVER" ]]; then
+            echo "▸ argocd_server not set — discovery skipped, build proceeds (no sync)"
+            emit true 0 ""
+            exit 0
+          fi
+
+          if [[ -n "$APP_OVERRIDE" ]]; then
+            echo "▸ explicit argocd_app='${APP_OVERRIDE}' — discovery skipped"
+            emit true 1 "$APP_OVERRIDE"
+            exit 0
+          fi
+
+          resp=$(curl -sS -G \
+            -w '\n%{http_code}' \
+            -H "Authorization: Bearer $ARGOCD_TOKEN" \
+            --data-urlencode "selector=${selector}" \
+            "https://${ARGOCD_SERVER}/api/v1/applications") || resp=""
+          code=$(printf '%s' "$resp" | tail -n1)
+          body=$(printf '%s' "$resp" | sed '$d')
+
+          if [ "$code" != "200" ]; then
+            echo "::error::ArgoCD API returned HTTP ${code:-000} for selector '${selector}' — cannot resolve deploy targets"
+            exit 1
+          fi
+
+          apps=$(printf '%s' "$body" | jq -r '.items[]?.metadata.name // empty')
+          count=$(printf '%s\n' "$apps" | awk 'NF' | wc -l | tr -d ' ')
+
+          if [[ -z "${apps:-}" ]]; then
+            echo "::notice::No ArgoCD Apps match selector '${selector}' — env '${ENV}' is not deployed; build, bump and sync will be skipped"
+            emit false 0 ""
+            exit 0
+          fi
+
+          emit true "$count" "$apps"
+
+  build:
+    needs: [context, precheck]
+    if: ${{ needs.precheck.outputs.deploy_enabled == 'true' }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 60
+    env:
+      HAS_VAULT_STATIC: ${{ secrets.VAULT_TOKEN_STATIC != '' }}
+    permissions:
+      contents: read
+      packages: write
+      actions: write
+      id-token: write
+    outputs:
+      va_status: ${{ steps.args.outputs.va_status }}
+      va_count: ${{ steps.args.outputs.va_count }}
+      va_keys: ${{ steps.args.outputs.va_keys }}
+      va_path: ${{ steps.args.outputs.va_path }}
+      va_url: ${{ steps.args.outputs.va_url }}
+      rt_status: ${{ steps.runtime.outputs.rt_status }}
+      rt_count: ${{ steps.runtime.outputs.rt_count }}
+      rt_keys: ${{ steps.runtime.outputs.rt_keys }}
+      rt_path: ${{ steps.runtime.outputs.rt_path }}
+      rt_url: ${{ steps.runtime.outputs.rt_url }}
+      rt_extra_count: ${{ steps.runtime.outputs.rt_extra_count }}
+      rt_extra_paths: ${{ steps.runtime.outputs.rt_extra_paths }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Persist build meta
+        run: |
+          {
+            echo "IMAGE=${{ needs.context.outputs.image_name }}"
+            echo "TAG=${{ needs.context.outputs.tag }}"
+          } > build-meta.env
+
+      - name: Upload build meta
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-meta-${{ inputs.app }}-${{ inputs.component }}
+          path: build-meta.env
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to container registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ needs.context.outputs.registry }}
+          username: ${{ inputs.registry_username != '' && inputs.registry_username || github.actor }}
+          password: ${{ secrets.REGISTRY_PASSWORD || secrets.GITHUB_TOKEN }}
+
+      - name: Compute Vault path
+        id: vault-path
+        if: ${{ inputs.vault_server != '' }}
+        env:
+          P: ${{ inputs.vault_path != '' && inputs.vault_path
+                || (inputs.component == 'main' && format('gh-actions/data/{0}/{1}/{2}', inputs.team, inputs.app, needs.context.outputs.env))
+                || format('gh-actions/data/{0}/{1}/{2}/{3}', inputs.team, inputs.app, inputs.component, needs.context.outputs.env) }}
+        run: echo "path=$P" >> "$GITHUB_OUTPUT"
+
+      - name: Probe Vault path
+        id: vault-probe
+        if: ${{ inputs.vault_server != '' }}
+        env:
+          VAULT_SERVER: ${{ inputs.vault_server }}
+          KV_PATH: ${{ steps.vault-path.outputs.path }}
+          VAULT_ROLE: ${{ inputs.vault_role }}
+          VAULT_AUTH_PATH: ${{ inputs.vault_auth_path }}
+          VAULT_AUDIENCE: ${{ inputs.vault_audience != '' && inputs.vault_audience || format('https://github.com/{0}', github.repository_owner) }}
+          VAULT_TOKEN_STATIC: ${{ secrets.VAULT_TOKEN_STATIC }}
+        run: |
+          set -euo pipefail
+
+          VAULT_SERVER="$(printf '%s' "$VAULT_SERVER" | tr -d '[:space:]')"
+          KV_PATH="$(printf '%s' "$KV_PATH" | tr -d '[:space:]')"
+          VAULT_AUDIENCE="$(printf '%s' "$VAULT_AUDIENCE" | tr -d '[:space:]')"
+          VAULT_AUTH_PATH="$(printf '%s' "$VAULT_AUTH_PATH" | tr -d '[:space:]')"
+          VAULT_ROLE="$(printf '%s' "$VAULT_ROLE" | tr -d '[:space:]')"
+
+          if [ -n "${VAULT_TOKEN_STATIC:-}" ]; then
+            VAULT_TOKEN_STATIC="$(printf '%s' "$VAULT_TOKEN_STATIC" | tr -d '[:space:]')"
+            token="$VAULT_TOKEN_STATIC"
+            echo "▸ Vault auth: static token (OIDC fallback)"
+          else
+            jwt=$(curl -fsSL \
+              -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${VAULT_AUDIENCE}" | jq -r .value)
+            token=$(curl -fsSL --data "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${jwt}\"}" \
+              "${VAULT_SERVER}/v1/auth/${VAULT_AUTH_PATH}/login" | jq -r .auth.client_token)
+          fi
+          code=$(curl -sSL -o /dev/null -w "%{http_code}" \
+            -H "X-Vault-Token: $token" "${VAULT_SERVER}/v1/${KV_PATH}")
+          if [ "$code" = "200" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif [ "$code" = "404" ]; then
+            cc=$(curl -sSL -o /dev/null -w "%{http_code}" \
+              -X POST -H "X-Vault-Token: $token" \
+              -d '{"data":{}}' "${VAULT_SERVER}/v1/${KV_PATH}")
+            if [ "$cc" = "200" ] || [ "$cc" = "204" ]; then
+              echo "::notice::Vault path '${KV_PATH/\/data\///}' auto-created (empty) — populate via Vault UI"
+            else
+              echo "::warning::Failed to create empty Vault path '${KV_PATH/\/data\///}' (HTTP $cc)"
+            fi
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Vault probe '${KV_PATH/\/data\///}' returned HTTP $code"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch build-args from Vault (JWT)
+        if: ${{ inputs.vault_server != '' && steps.vault-probe.outputs.exists == 'true' && env.HAS_VAULT_STATIC == 'false' }}
+        uses: hashicorp/vault-action@v4
+        with:
+          url: ${{ inputs.vault_server }}
+          method: jwt
+          path: ${{ inputs.vault_auth_path }}
+          role: ${{ inputs.vault_role }}
+          jwtGithubAudience: ${{ inputs.vault_audience != '' && inputs.vault_audience || format('https://github.com/{0}', github.repository_owner) }}
+          exportEnv: true
+          ignoreNotFound: true
+          secrets: |
+            ${{ steps.vault-path.outputs.path }} * | VAULT_
+
+      - name: Fetch build-args from Vault (TOKEN)
+        if: ${{ inputs.vault_server != '' && steps.vault-probe.outputs.exists == 'true' && env.HAS_VAULT_STATIC == 'true' }}
+        uses: hashicorp/vault-action@v4
+        with:
+          url: ${{ inputs.vault_server }}
+          method: token
+          token: ${{ secrets.VAULT_TOKEN_STATIC }}
+          exportEnv: true
+          ignoreNotFound: true
+          secrets: |
+            ${{ steps.vault-path.outputs.path }} * | VAULT_
+
+      - name: Merge build-args
+        id: args
+        env:
+          STATIC_ARGS: ${{ inputs.build_args }}
+          KV_PATH: ${{ steps.vault-path.outputs.path }}
+          KV_SERVER: ${{ inputs.vault_server }}
+          EXISTS_FLAG: ${{ steps.vault-probe.outputs.exists }}
+        run: |
+          set -euo pipefail
+          {
+            echo "merged<<__EOF__"
+            [[ -n "${STATIC_ARGS:-}" ]] && printf '%s\n' "$STATIC_ARGS"
+            while IFS= read -r line; do
+              case "$line" in
+                VAULT_*=*) printf '%s\n' "${line#VAULT_}" ;;
+              esac
+            done < <(env)
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ -n "${KV_PATH:-}" ]]; then
+            vault_keys=()
+            while IFS= read -r name; do
+              [[ "$name" == VAULT_* ]] && vault_keys+=("${name#VAULT_}")
+            done < <(env | awk -F= '{print $1}')
+
+            display_path="${KV_PATH/\/data\///}"
+            mount="${display_path%%/*}"
+            rest="${display_path#*/}"
+            encoded_rest=$(jq -rn --arg s "$rest" '$s|@uri')
+            ui_url="${KV_SERVER}/ui/vault/secrets/${mount}/kv/${encoded_rest}/details"
+
+            status="${EXISTS_FLAG:-exists}"
+            [[ "$status" == "true" ]] && status="exists"
+            [[ "$status" == "false" ]] && status="created"
+
+            keys_csv=""; sep=""
+            for k in "${vault_keys[@]}"; do
+              keys_csv+="${sep}${k}"; sep=","
+            done
+
+            {
+              echo "va_status=$status"
+              echo "va_count=${#vault_keys[@]}"
+              echo "va_keys=$keys_csv"
+              echo "va_path=$display_path"
+              echo "va_url=$ui_url"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "va_status=skipped" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ensure k8s-workloads runtime secrets path
+        id: runtime
+        if: ${{ inputs.vault_server != '' }}
+        env:
+          VAULT_SERVER: ${{ inputs.vault_server }}
+          VAULT_ROLE: ${{ inputs.vault_role }}
+          VAULT_AUTH_PATH: ${{ inputs.vault_auth_path }}
+          VAULT_AUDIENCE: ${{ inputs.vault_audience != '' && inputs.vault_audience || format('https://github.com/{0}', github.repository_owner) }}
+          VAULT_TOKEN_STATIC: ${{ secrets.VAULT_TOKEN_STATIC }}
+          KV_PATH: ${{ inputs.component == 'main'
+                      && format('k8s-workloads/data/{0}/{1}/{2}', inputs.team, inputs.app, needs.context.outputs.env)
+                      || format('k8s-workloads/data/{0}/{1}/{2}/{3}', inputs.team, inputs.app, inputs.component, needs.context.outputs.env) }}
+          EXTRA_COMPONENTS: ${{ inputs.extra_components }}
+          IN_TEAM: ${{ inputs.team }}
+          IN_APP: ${{ inputs.app }}
+          IN_ENV: ${{ needs.context.outputs.env }}
+        run: |
+          set -euo pipefail
+
+          VAULT_SERVER="$(printf '%s' "$VAULT_SERVER" | tr -d '[:space:]')"
+          KV_PATH="$(printf '%s' "$KV_PATH" | tr -d '[:space:]')"
+          VAULT_AUDIENCE="$(printf '%s' "$VAULT_AUDIENCE" | tr -d '[:space:]')"
+          VAULT_AUTH_PATH="$(printf '%s' "$VAULT_AUTH_PATH" | tr -d '[:space:]')"
+          VAULT_ROLE="$(printf '%s' "$VAULT_ROLE" | tr -d '[:space:]')"
+
+          if [ -n "${VAULT_TOKEN_STATIC:-}" ]; then
+            VAULT_TOKEN_STATIC="$(printf '%s' "$VAULT_TOKEN_STATIC" | tr -d '[:space:]')"
+            token="$VAULT_TOKEN_STATIC"
+          else
+            jwt=$(curl -fsSL \
+              -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${VAULT_AUDIENCE}" | jq -r .value)
+            token=$(curl -fsSL --data "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${jwt}\"}" \
+              "${VAULT_SERVER}/v1/auth/${VAULT_AUTH_PATH}/login" | jq -r .auth.client_token)
+          fi
+
+          resp=$(curl -sSL -w "\n%{http_code}" -H "X-Vault-Token: $token" \
+            "${VAULT_SERVER}/v1/${KV_PATH}")
+          code=$(printf '%s' "$resp" | tail -n1)
+          body=$(printf '%s' "$resp" | sed '$d')
+
+          status=""
+          keys=()
+          if [ "$code" = "200" ]; then
+            status="exists"
+            mapfile -t keys < <(printf '%s' "$body" | jq -r '.data.data | keys[]?' 2>/dev/null)
+          elif [ "$code" = "404" ]; then
+            cc=$(curl -sSL -o /dev/null -w "%{http_code}" \
+              -X POST -H "X-Vault-Token: $token" \
+              -d '{"data":{}}' "${VAULT_SERVER}/v1/${KV_PATH}")
+            if [ "$cc" = "200" ] || [ "$cc" = "204" ]; then
+              status="created"
+            else
+              echo "::warning::Failed to create empty Vault path '${KV_PATH/\/data\///}' (HTTP $cc)"
+              status="create-failed"
+            fi
+          else
+            echo "::warning::Vault probe '${KV_PATH/\/data\///}' returned HTTP $code"
+            status="probe-failed"
+          fi
+
+          display_path="${KV_PATH/\/data\///}"
+          mount="${display_path%%/*}"
+          rest="${display_path#*/}"
+          encoded_rest=$(jq -rn --arg s "$rest" '$s|@uri')
+          ui_url="${VAULT_SERVER}/ui/vault/secrets/${mount}/kv/${encoded_rest}/details"
+
+          keys_csv=""; sep=""
+          for k in "${keys[@]}"; do
+            keys_csv+="${sep}${k}"; sep=","
+          done
+
+          {
+            echo "rt_status=$status"
+            echo "rt_count=${#keys[@]}"
+            echo "rt_keys=$keys_csv"
+            echo "rt_path=$display_path"
+            echo "rt_url=$ui_url"
+          } >> "$GITHUB_OUTPUT"
+
+          extra_count=0
+          extra_paths=""; sep_e=""
+          if [ -n "${EXTRA_COMPONENTS:-}" ]; then
+            IN_TEAM="$(printf '%s' "$IN_TEAM" | tr -d '[:space:]')"
+            IN_APP="$(printf '%s' "$IN_APP" | tr -d '[:space:]')"
+            IN_ENV="$(printf '%s' "$IN_ENV" | tr -d '[:space:]')"
+            while IFS= read -r extra; do
+              extra="${extra//[[:space:]]/}"
+              [ -z "$extra" ] && continue
+              EXTRA_PATH="k8s-workloads/data/${IN_TEAM}/${IN_APP}/${extra}/${IN_ENV}"
+              ecode=$(curl -sSL -o /dev/null -w "%{http_code}" \
+                -H "X-Vault-Token: $token" "${VAULT_SERVER}/v1/${EXTRA_PATH}")
+              if [ "$ecode" = "404" ]; then
+                ecc=$(curl -sSL -o /dev/null -w "%{http_code}" \
+                  -X POST -H "X-Vault-Token: $token" \
+                  -d '{"data":{}}' "${VAULT_SERVER}/v1/${EXTRA_PATH}")
+                if [ "$ecc" = "200" ] || [ "$ecc" = "204" ]; then
+                  echo "::notice::Vault path '${EXTRA_PATH/\/data\///}' auto-created (empty) — populate via Vault UI"
+                else
+                  echo "::warning::Failed to create empty Vault path '${EXTRA_PATH/\/data\///}' (HTTP $ecc)"
+                fi
+              elif [ "$ecode" != "200" ]; then
+                echo "::warning::Vault probe '${EXTRA_PATH/\/data\///}' returned HTTP $ecode"
+              fi
+              extra_count=$((extra_count + 1))
+              extra_paths+="${sep_e}${EXTRA_PATH/\/data\///}"; sep_e=","
+            done <<< "$EXTRA_COMPONENTS"
+          fi
+          {
+            echo "rt_extra_count=$extra_count"
+            echo "rt_extra_paths=$extra_paths"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        env:
+          DOCKER_BUILD_SUMMARY: "false"
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ needs.context.outputs.tags }}
+          build-args: ${{ steps.args.outputs.merged }}
+          cache-from: ${{ inputs.cache && 'type=gha' || '' }}
+          cache-to: ${{ inputs.cache && 'type=gha,mode=max' || '' }}
+
+  bump:
+    needs: [context, build, precheck]
+    if: ${{ needs.build.result == 'success' && (inputs.argocd_server == '' || needs.precheck.outputs.apps != '') }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      values_file: ${{ steps.bump.outputs.values_file }}
+      values_url: ${{ steps.bump.outputs.values_url }}
+      extras_bumped: ${{ steps.bump.outputs.extras_bumped }}
+    steps:
+      - name: Checkout argocd-workloads
+        uses: actions/checkout@v6
+        with:
+          repository: gear-ops/argocd-workloads
+          token: ${{ secrets.WORKLOADS_REPO_TOKEN }}
+          path: workloads
+
+      - name: Download build meta
+        uses: actions/download-artifact@v8
+        with:
+          name: build-meta-${{ inputs.app }}-${{ inputs.component }}
+          path: .
+
+      - name: Load build meta into env
+        run: cat build-meta.env >> "$GITHUB_ENV"
+
+      - name: Install yq
+        run: |
+          set -euo pipefail
+          sudo wget -q https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq
+          sudo chmod +x /usr/bin/yq
+
+      - name: Bump image tags
+        id: bump
+        working-directory: workloads
+        env:
+          TEAM: ${{ inputs.team }}
+          APP: ${{ inputs.app }}
+          ENV: ${{ needs.context.outputs.env }}
+          OVERRIDE: ${{ inputs.values_path }}
+        run: |
+          set -euo pipefail
+
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          TEAM=$(strip "$TEAM")
+          APP=$(strip "$APP")
+          ENV=$(strip "$ENV")
+          OVERRIDE=$(strip "$OVERRIDE")
+          IMAGE=$(strip "$IMAGE")
+          TAG=$(strip "$TAG")
+
+          [[ -n "$IMAGE" && -n "$TAG" ]] || {
+            echo "::error::build meta missing — IMAGE='$IMAGE' TAG='$TAG' (artifact build-meta-${{ inputs.app }}-${{ inputs.component }} not downloaded or empty)"
+            exit 1
+          }
+
+          chart_dir="charts/${TEAM}/${APP}"
+          [[ -d "$chart_dir" ]] || { echo "::error::Chart directory '$chart_dir' not found in argocd-workloads"; exit 1; }
+
+          if [[ -n "$OVERRIDE" ]]; then
+            values="$chart_dir/$OVERRIDE"
+          elif [[ -f "$chart_dir/values/${ENV}.yaml" ]]; then
+            values="$chart_dir/values/${ENV}.yaml"
+          else
+            values="$chart_dir/values.yaml"
+          fi
+          [[ -f "$values" ]] || { echo "::error::Values file '$values' not found"; exit 1; }
+
+          repo="${IMAGE%:*}"
+          ctrl='${{ inputs.component }}'
+          yq -i ".components.${ctrl}.containers.main.image.repository = \"$repo\"" "$values"
+          yq -i ".components.${ctrl}.containers.main.image.tag        = \"$TAG\"" "$values"
+          echo "▸ bumped components.${ctrl}.containers.main"
+
+          INIT_CONTAINERS='${{ inputs.init_containers }}'
+          if [[ -n "$INIT_CONTAINERS" ]]; then
+            while IFS= read -r ic; do
+              ic="${ic//[[:space:]]/}"
+              [[ -z "$ic" ]] && continue
+              yq -i ".components.${ctrl}.initContainers.${ic}.image.repository = \"$repo\"" "$values"
+              yq -i ".components.${ctrl}.initContainers.${ic}.image.tag        = \"$TAG\"" "$values"
+              echo "▸ bumped components.${ctrl}.initContainers.${ic}"
+            done <<< "$INIT_CONTAINERS"
+          fi
+
+          EXTRA_COMPONENTS='${{ inputs.extra_components }}'
+          extras_bumped=""; ex_sep=""
+          if [[ -n "$EXTRA_COMPONENTS" ]]; then
+            while IFS= read -r extra; do
+              extra="${extra//[[:space:]]/}"
+              [[ -z "$extra" ]] && continue
+              exists=$(yq -r ".components.${extra} // \"\"" "$values")
+              if [[ -z "$exists" || "$exists" == "null" ]]; then
+                echo "::error::extra_components entry '${extra}' not found in ${values} under .components"
+                exit 1
+              fi
+              yq -i ".components.${extra}.containers.main.image.repository = \"$repo\"" "$values"
+              yq -i ".components.${extra}.containers.main.image.tag        = \"$TAG\"" "$values"
+              echo "▸ bumped components.${extra}.containers.main"
+
+              if [[ -n "$INIT_CONTAINERS" ]]; then
+                while IFS= read -r ic; do
+                  ic="${ic//[[:space:]]/}"
+                  [[ -z "$ic" ]] && continue
+                  has_ic=$(yq -r ".components.${extra}.initContainers.${ic} // \"\"" "$values")
+                  if [[ -n "$has_ic" && "$has_ic" != "null" ]]; then
+                    yq -i ".components.${extra}.initContainers.${ic}.image.repository = \"$repo\"" "$values"
+                    yq -i ".components.${extra}.initContainers.${ic}.image.tag        = \"$TAG\"" "$values"
+                    echo "▸ bumped components.${extra}.initContainers.${ic}"
+                  fi
+                done <<< "$INIT_CONTAINERS"
+              fi
+              extras_bumped+="${ex_sep}${extra}"; ex_sep=","
+            done <<< "$EXTRA_COMPONENTS"
+          fi
+          echo "extras_bumped=$extras_bumped" >> "$GITHUB_OUTPUT"
+
+          echo "▸ values diff:"
+          git --no-pager diff "$values" || true
+
+          values_url="https://github.com/gear-ops/argocd-workloads/blob/main/${values}"
+
+          {
+            echo "values_file=$values"
+            echo "values_url=$values_url"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push
+        uses: EndBug/add-and-commit@v10.0.0
+        with:
+          cwd: ./workloads
+          pull: '--rebase --autostash'
+          message: "ci(${{ inputs.team }}/${{ inputs.app }}/${{ inputs.component }}${{ steps.bump.outputs.extras_bumped != '' && format('+{0}', steps.bump.outputs.extras_bumped) || '' }}): ${{ needs.context.outputs.env }} → ${{ env.TAG }}"
+          default_author: github_actions
+
+  release:
+    needs: [build, context]
+    if: ${{ inputs.create_release && github.ref_type == 'tag' && needs.context.outputs.prod_tag_prefix != '' && startsWith(github.ref_name, needs.context.outputs.prod_tag_prefix) }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download build meta
+        uses: actions/download-artifact@v8
+        with:
+          name: build-meta-${{ inputs.app }}-${{ inputs.component }}
+          path: .
+
+      - name: Load build meta into env
+        run: cat build-meta.env >> "$GITHUB_ENV"
+
+      - name: Compute release body chunk
+        id: body
+        env:
+          COMPONENT: ${{ inputs.component }}
+        run: |
+          set -euo pipefail
+
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          IMAGE=$(strip "$IMAGE")
+          COMPONENT=$(strip "$COMPONENT")
+
+          DIGEST=""
+          if command -v docker >/dev/null; then
+            DIGEST=$(docker buildx imagetools inspect "$IMAGE" \
+              --format '{{.Manifest.Digest}}' 2>/dev/null || echo "")
+          fi
+          {
+            echo "body<<__EOF__"
+            if [[ "$COMPONENT" != "main" ]]; then
+              echo "### ${COMPONENT}"
+              echo
+            fi
+            echo '```'
+            echo "$IMAGE"
+            [[ -n "$DIGEST" ]] && echo "${IMAGE%:*}@${DIGEST}"
+            echo '```'
+            echo
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or append GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: ${{ steps.body.outputs.body }}
+          append_body: true
+          generate_release_notes: false
+
+  cleanup:
+    needs: [build, context]
+    if: ${{ inputs.cleanup_enabled && needs.build.result == 'success' }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 5
+    permissions:
+      packages: write
+    outputs:
+      deleted_count: ${{ steps.summary.outputs.deleted_count }}
+      failed_count: ${{ steps.summary.outputs.failed_count }}
+      keep: ${{ steps.summary.outputs.keep }}
+    steps:
+      - name: Resolve cleanup parameters
+        id: pkg
+        env:
+          REGISTRY: ${{ needs.context.outputs.registry }}
+          PROD_PREFIX: ${{ needs.context.outputs.prod_tag_prefix }}
+          ADDITIONAL_TAGS: ${{ inputs.additional_tags }}
+          RELEASE_PFX: ${{ needs.context.outputs.release_prefix }}
+          PREFIX_TAG: ${{ inputs.prefix_tag }}
+        run: |
+          set -euo pipefail
+
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          REGISTRY=$(strip "$REGISTRY")
+          PROD_PREFIX=$(strip "$PROD_PREFIX")
+          RELEASE_PFX=$(strip "$RELEASE_PFX")
+          PREFIX_TAG=$(strip "$PREFIX_TAG")
+
+          path="${REGISTRY#ghcr.io/}"
+          echo "account=${path%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${path#*/}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$PREFIX_TAG" == "true" && -n "$RELEASE_PFX" ]]; then
+            protection="${RELEASE_PFX}-*"
+            protection+=" !${RELEASE_PFX}-latest"
+            [[ -n "$PROD_PREFIX" ]] && protection+=" !${PROD_PREFIX}*"
+            while IFS= read -r t; do
+              t="${t//[[:space:]]/}"
+              [[ -n "$t" ]] && protection+=" !${RELEASE_PFX}-${t}"
+            done <<< "${ADDITIONAL_TAGS:-}"
+          else
+            protection="!latest"
+            [[ -n "$PROD_PREFIX" ]] && protection+=" !${PROD_PREFIX}*"
+            while IFS= read -r t; do
+              t="${t//[[:space:]]/}"
+              [[ -n "$t" ]] && protection+=" !${t}"
+            done <<< "${ADDITIONAL_TAGS:-}"
+          fi
+          echo "protection=${protection}" >> "$GITHUB_OUTPUT"
+
+      - name: Snapshot package versions (pre)
+        id: pre
+        env:
+          ACCOUNT: ${{ steps.pkg.outputs.account }}
+          NAME: ${{ steps.pkg.outputs.name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          base="https://api.github.com/orgs/${ACCOUNT}/packages/container/${NAME}/versions"
+          code=$(curl -sS -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GH_TOKEN" "${base}?per_page=1")
+          if [ "$code" != "200" ]; then
+            base="https://api.github.com/users/${ACCOUNT}/packages/container/${NAME}/versions"
+          fi
+
+          page=1; ids=""
+          while :; do
+            chunk=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "${base}?per_page=100&page=${page}")
+            n=$(printf '%s' "$chunk" | jq 'length')
+            [ "$n" = "0" ] && break
+            ids+=$(printf '%s' "$chunk" | jq -r '.[].id')$'\n'
+            [ "$n" -lt 100 ] && break
+            page=$((page+1))
+          done
+          {
+            echo "base=$base"
+            echo "ids<<__EOF__"
+            printf '%s' "$ids"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prune image versions
+        id: prune
+        uses: snok/container-retention-policy@v3.1.0
+        with:
+          account: ${{ steps.pkg.outputs.account }}
+          token: ${{ github.token }}
+          image-names: ${{ steps.pkg.outputs.name }}
+          image-tags: ${{ steps.pkg.outputs.protection }}
+          keep-n-most-recent: ${{ inputs.cleanup_keep }}
+          tag-selection: tagged
+          cut-off: 0s
+          dry-run: ${{ inputs.cleanup_dry_run }}
+
+      - name: Diff package versions (post) and export count
+        id: summary
+        env:
+          BASE: ${{ steps.pre.outputs.base }}
+          PRE_IDS: ${{ steps.pre.outputs.ids }}
+          GH_TOKEN: ${{ github.token }}
+          KEEP: ${{ inputs.cleanup_keep }}
+          DRY_RUN: ${{ inputs.cleanup_dry_run }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            {
+              echo "deleted_count=0"
+              echo "failed_count=0"
+              echo "keep=$KEEP"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          page=1; post_ids=""
+          while :; do
+            chunk=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "${BASE}?per_page=100&page=${page}")
+            n=$(printf '%s' "$chunk" | jq 'length')
+            [ "$n" = "0" ] && break
+            post_ids+=$(printf '%s' "$chunk" | jq -r '.[].id')$'\n'
+            [ "$n" -lt 100 ] && break
+            page=$((page+1))
+          done
+
+          deleted=$(comm -23 <(printf '%s' "$PRE_IDS" | awk 'NF' | sort) \
+                              <(printf '%s' "$post_ids" | awk 'NF' | sort))
+          n_del=$(printf '%s\n' "$deleted" | awk 'NF' | wc -l | tr -d ' ')
+
+          {
+            echo "deleted_count=$n_del"
+            echo "failed_count=0"
+            echo "keep=$KEEP"
+          } >> "$GITHUB_OUTPUT"
+
+  sync:
+    needs: [build, bump, precheck]
+    if: ${{ inputs.argocd_server != '' && needs.bump.result == 'success' && needs.precheck.outputs.apps != '' }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 15
+    outputs:
+      results: ${{ steps.wait.outputs.results }}
+    env:
+      ARGOCD_OPTS: ${{ inputs.argocd_grpc_web && '--grpc-web' || '' }}
+    steps:
+      - name: Sanitize env (strip whitespace from inputs/secrets)
+        env:
+          RAW_SERVER: ${{ inputs.argocd_server }}
+          RAW_TOKEN: ${{ secrets.ARGOCD_TOKEN }}
+        run: |
+          {
+            printf 'ARGOCD_SERVER=%s\n'     "$(printf '%s' "$RAW_SERVER" | tr -d '[:space:]')"
+            printf 'ARGOCD_AUTH_TOKEN=%s\n' "$(printf '%s' "$RAW_TOKEN"  | tr -d '[:space:]')"
+          } >> "$GITHUB_ENV"
+
+      - name: Install argocd CLI
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL -o /usr/local/bin/argocd \
+            "https://${ARGOCD_SERVER}/download/argocd-linux-amd64"
+          sudo chmod +x /usr/local/bin/argocd
+          argocd version --client
+
+      - name: Refresh and wait for sync
+        id: wait
+        env:
+          APPS: ${{ needs.precheck.outputs.apps }}
+          TIMEOUT: ${{ inputs.argocd_timeout }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t apps < <(printf '%s\n' "$APPS" | awk 'NF')
+
+          rc=0
+          results=""
+          for app in "${apps[@]}"; do
+            echo ""
+            echo "▸ $app"
+            argocd app get "$app" --hard-refresh
+            if argocd app wait "$app" --sync --health --timeout "$TIMEOUT"; then
+              results+="${app}|ok"$'\n'
+            else
+              results+="${app}|fail"$'\n'
+              rc=1
+            fi
+          done
+
+          {
+            echo "results<<__EOF__"
+            printf '%s' "$results"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+          exit $rc
+
+  report:
+    needs: [changes, context, precheck, build, bump, release, cleanup, sync]
+    if: ${{ always() }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 2
+    permissions:
+      actions: read       # download-artifact
+    steps:
+      - name: Download build meta
+        if: ${{ needs.build.result == 'success' }}
+        uses: actions/download-artifact@v8
+        with:
+          name: build-meta-${{ inputs.app }}-${{ inputs.component }}
+          path: .
+        continue-on-error: true
+
+      - name: Expose build meta as BUILD_IMAGE / BUILD_TAG
+        if: ${{ needs.build.result == 'success' }}
+        run: |
+          # build-meta.env has IMAGE=... / TAG=...; prefix with BUILD_ for report env names.
+          [[ -f build-meta.env ]] && sed 's/^/BUILD_/' build-meta.env >> "$GITHUB_ENV" || true
+
+      - env:
+          TEAM: ${{ inputs.team }}
+          APP: ${{ inputs.app }}
+          COMPONENT: ${{ inputs.component }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          SERVER_URL: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
+          ARGOCD_SERVER: ${{ inputs.argocd_server }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          CHANGES_MATCHED: ${{ needs.changes.outputs.matched }}
+          CHANGES_DETAIL: ${{ needs.changes.outputs.detail }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          BUILD_ENV: ${{ needs.context.outputs.env }}
+          DEPLOY_ENABLED: ${{ needs.precheck.outputs.deploy_enabled }}
+          VA_STATUS: ${{ needs.build.outputs.va_status }}
+          VA_PATH: ${{ needs.build.outputs.va_path }}
+          VA_URL: ${{ needs.build.outputs.va_url }}
+          RT_STATUS: ${{ needs.build.outputs.rt_status }}
+          RT_PATH: ${{ needs.build.outputs.rt_path }}
+          RT_URL: ${{ needs.build.outputs.rt_url }}
+          RT_EXTRA_PATHS: ${{ needs.build.outputs.rt_extra_paths }}
+          VAULT_SERVER: ${{ inputs.vault_server }}
+          CHECK_RESULT: ${{ needs.precheck.result }}
+          CHECK_COUNT: ${{ needs.precheck.outputs.count }}
+          CHECK_APPS: ${{ needs.precheck.outputs.apps }}
+          BUMP_RESULT: ${{ needs.bump.result }}
+          BUMP_VALUES: ${{ needs.bump.outputs.values_file }}
+          BUMP_VALUES_URL: ${{ needs.bump.outputs.values_url }}
+          BUMP_EXTRAS: ${{ needs.bump.outputs.extras_bumped }}
+          JOB: ${{ github.job }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          CLEANUP_RESULT: ${{ needs.cleanup.result }}
+          CLEANUP_DELETED: ${{ needs.cleanup.outputs.deleted_count }}
+          CLEANUP_FAILED: ${{ needs.cleanup.outputs.failed_count }}
+          CLEANUP_KEEP: ${{ needs.cleanup.outputs.keep }}
+          CLEANUP_DRY_RUN: ${{ inputs.cleanup_dry_run }}
+          SYNC_RESULT: ${{ needs.sync.result }}
+          SYNC_RESULTS: ${{ needs.sync.outputs.results }}
+        run: |
+          set -euo pipefail
+
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          ARGOCD_SERVER=$(strip "$ARGOCD_SERVER")
+          TEAM=$(strip "$TEAM")
+          APP=$(strip "$APP")
+          COMPONENT=$(strip "$COMPONENT")
+          BUILD_ENV=$(strip "$BUILD_ENV")
+          BUILD_IMAGE=$(strip "${BUILD_IMAGE:-}")
+          BUILD_TAG=$(strip "${BUILD_TAG:-}")
+
+          if [[ "$CHANGES_MATCHED" == "false" ]]; then
+            exit 0
+          fi
+
+          if [[ "${DEPLOY_ENABLED:-}" == "false" ]]; then
+            comp=""
+            [[ -n "$COMPONENT" && "$COMPONENT" != "main" ]] && comp=" / \`${COMPONENT}\`"
+            echo "### ⏭ \`${TEAM}/${APP}\`${comp} — env \`${BUILD_ENV}\` not enabled, build & deploy skipped" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          logs_url="${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}"
+
+          row() {
+            local stage="$1" result="$2" skip_reason="$3" success_detail="$4" failure_detail="$5"
+            local status detail
+            case "${result:-skipped}" in
+              success)
+                status="✅"; detail="$success_detail" ;;
+              failure)
+                status="❌"; detail="${failure_detail:-[view logs](${logs_url})}" ;;
+              cancelled)
+                status="⏹"; detail="cancelled" ;;
+              skipped|"")
+                status="⏭"; detail="${skip_reason:-skipped}" ;;
+              *)
+                status="❔"; detail="$result" ;;
+            esac
+            echo "| ${stage} | ${status} ${result:-skipped} | ${detail} |"
+          }
+
+          vault_status() {
+            case "${1:-}" in
+              exists)        echo "📁 exists" ;;
+              created)       echo "🆕 created" ;;
+              create-failed) echo "❌ create-failed" ;;
+              probe-failed)  echo "⚠️ probe-failed" ;;
+              skipped)       echo "⏭ skipped" ;;
+              "")            echo "?" ;;
+              *)             echo "$1" ;;
+            esac
+          }
+
+          ghcr_pkg_url=""
+          ghcr_deleted_url=""
+          if [[ "${BUILD_IMAGE:-}" == ghcr.io/* ]]; then
+            img_no_tag="${BUILD_IMAGE%:*}"
+            pkg_path="${img_no_tag#ghcr.io/}"
+            pkg_name="${pkg_path#*/}"
+            ghcr_pkg_url="${SERVER_URL}/${REPO}/pkgs/container/${pkg_name}"
+            ghcr_deleted_url="${ghcr_pkg_url}/versions?filters%5Bversions%5D=deleted"
+          fi
+
+          repo_url="${SERVER_URL}/${REPO}"
+          commit_url="${repo_url}/commit/${SHA}"
+          ref_url=""
+          if [[ "${REF:-}" =~ ^v[0-9] ]] || [[ "${REF}" != "${SHA}" && -n "${REF}" ]]; then
+            ref_url="${repo_url}/tree/${REF}"
+          fi
+
+          ns_url=""
+          ns_name=""
+          if [[ -n "$BUILD_ENV" ]]; then
+            ns_name="${TEAM}-${BUILD_ENV}-${APP}"
+            case "$BUILD_ENV" in
+              prod) dashboard_host="k8s-prod-dashboard.gear.foundation" ;;
+              *)    dashboard_host="k8s-stg-dashboard.gear.foundation" ;;
+            esac
+            ns_url="https://${dashboard_host}/c/main/pods?namespace=${ns_name}"
+          fi
+
+          # Header
+          extras_md=""
+          if [[ -n "${BUMP_EXTRAS:-}" ]]; then
+            IFS=',' read -ra _ex <<< "$BUMP_EXTRAS"
+            for e in "${_ex[@]}"; do
+              [[ -z "$e" ]] && continue
+              [[ -n "$extras_md" ]] && extras_md+=", "
+              extras_md+="\`${e}\`"
+            done
+          fi
+
+          {
+            echo "## Build & deploy summary — \`${JOB}\`"
+            echo
+            echo "**Team / App:** \`${TEAM} / ${APP}\`  "
+            [[ "$COMPONENT" != "main" ]] && echo "**Component:** \`${COMPONENT}\`  "
+            [[ -n "$extras_md" ]] && echo "**Extra components:** ${extras_md}  "
+            [[ -n "$BUILD_ENV" ]] && echo "**Environment:** \`${BUILD_ENV}\`  "
+            [[ -n "$ns_url" ]] && echo "**Namespace:** [\`${ns_name}\`](${ns_url})  "
+            echo
+            echo "| Stage | Status | Detail |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Changes
+          if [[ "$CHANGES_MATCHED" == "false" ]]; then
+            echo "| 🔍 Changes | ⏭ no match | ${CHANGES_DETAIL:-paths_filter did not match} |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            row "🔍 Changes" "$CHANGES_RESULT" "skipped" "${CHANGES_DETAIL:-matched}" "" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Build args
+          if [[ -n "${VA_PATH:-}" ]]; then
+            echo "| 🔑 Build args | $(vault_status "${VA_STATUS:-}") | [\`${VA_PATH}\`](${VA_URL}) |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| 🔑 Build args | ⏭ skipped | vault_server not configured |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Runtime secrets
+          if [[ -n "${RT_PATH:-}" ]]; then
+            rt_detail="[\`${RT_PATH}\`](${RT_URL})"
+            if [[ -n "${RT_EXTRA_PATHS:-}" && -n "${VAULT_SERVER:-}" ]]; then
+              IFS=',' read -ra _rx <<< "$RT_EXTRA_PATHS"
+              for p in "${_rx[@]}"; do
+                [[ -z "$p" ]] && continue
+                mount="${p%%/*}"
+                rest="${p#*/}"
+                encoded_rest=$(jq -rn --arg s "$rest" '$s|@uri')
+                p_url="${VAULT_SERVER}/ui/vault/secrets/${mount}/kv/${encoded_rest}/details"
+                rt_detail+=", [\`${p}\`](${p_url})"
+              done
+            fi
+            echo "| 🔐 Runtime secrets | $(vault_status "${RT_STATUS:-}") | ${rt_detail} |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| 🔐 Runtime secrets | ⏭ skipped | vault_server not configured |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Build & push
+          if [[ -n "$BUILD_IMAGE" && -n "$ghcr_pkg_url" ]]; then
+            row "🐳 Build & push" "$BUILD_RESULT" "filter did not match" "[\`${BUILD_IMAGE}\`](${ghcr_pkg_url})" "" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ -n "$BUILD_IMAGE" ]]; then
+            row "🐳 Build & push" "$BUILD_RESULT" "filter did not match" "\`${BUILD_IMAGE}\`" "" >> "$GITHUB_STEP_SUMMARY"
+          else
+            row "🐳 Build & push" "$BUILD_RESULT" "filter did not match" "ok" "" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # ArgoCD discover
+          apps_md=""
+          if [[ -n "$CHECK_APPS" ]]; then
+            while IFS= read -r app; do
+              [[ -z "$app" ]] && continue
+              [[ -n "$apps_md" ]] && apps_md+=", "
+              apps_md+="[\`${app}\`](https://${ARGOCD_SERVER}/applications/argocd/${app})"
+            done <<< "$(printf '%s' "$CHECK_APPS" | awk 'NF')"
+          fi
+          if [[ "$ARGOCD_SERVER" == "" ]]; then
+            echo "| 🎯 Discover | ⏭ skipped | argocd_server not configured |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            row "🎯 Discover" "$CHECK_RESULT" "upstream skipped" "$apps_md" "" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Bump
+          bump_detail=""
+          if [[ -n "$BUMP_VALUES" ]]; then
+            bump_detail="[\`${BUMP_VALUES}\`](${BUMP_VALUES_URL}) → \`${BUILD_TAG}\`"
+            if [[ "$COMPONENT" != "main" || -n "${BUMP_EXTRAS:-}" ]]; then
+              comp_list="\`${COMPONENT}\`"
+              if [[ -n "${BUMP_EXTRAS:-}" ]]; then
+                IFS=',' read -ra _ex <<< "$BUMP_EXTRAS"
+                for e in "${_ex[@]}"; do
+                  [[ -z "$e" ]] && continue
+                  comp_list+=",\`${e}\`"
+                done
+              fi
+              bump_detail="component ${comp_list} ${bump_detail}"
+            fi
+          fi
+          bump_skip="upstream skipped"
+          if [[ "${CHECK_RESULT:-}" == "success" && "${CHECK_COUNT:-0}" == "0" ]]; then
+            bump_skip="no ArgoCD apps matched"
+          fi
+          row "📝 Bump" "$BUMP_RESULT" "$bump_skip" "${bump_detail:-ok}" "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Sync — link points to ?operation=true (Operation State panel: latest sync result + errors)
+          if [[ -z "$ARGOCD_SERVER" ]]; then
+            echo "| 🚀 Sync | ⏭ skipped | argocd_server not configured |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            sync_md=""
+            while IFS='|' read -r app outcome; do
+              [[ -z "$app" ]] && continue
+              [[ -n "$sync_md" ]] && sync_md+=", "
+              app_op_url="https://${ARGOCD_SERVER}/applications/argocd/${app}?operation=true"
+              if [[ "$outcome" == "fail" ]]; then
+                sync_md+="❌ [\`${app}\`](${app_op_url})"
+              else
+                sync_md+="[\`${app}\`](${app_op_url})"
+              fi
+            done <<< "${SYNC_RESULTS:-}"
+            row "🚀 Sync" "$SYNC_RESULT" "upstream skipped" "${sync_md:-ok}" "${sync_md:-failed}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Release
+          rel_detail=""
+          if [[ "$RELEASE_RESULT" == "success" ]]; then
+            rel_detail="[${REF}](${SERVER_URL}/${REPO}/releases/tag/${REF})"
+            [[ "$COMPONENT" != "main" ]] && rel_detail+=" — appended \`${COMPONENT}\` chunk"
+          fi
+          row "🏷 Release" "$RELEASE_RESULT" "ref does not match release tag pattern" "${rel_detail:-created}" "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Cleanup
+          cleanup_detail=""
+          if [[ "$CLEANUP_RESULT" == "success" ]]; then
+            cleanup_detail="pruned ${CLEANUP_DELETED:-0} / kept ${CLEANUP_KEEP:-?}"
+            cleanup_failed_n="${CLEANUP_FAILED:-0}"
+            (( cleanup_failed_n > 0 )) && cleanup_detail+=" / ${cleanup_failed_n} failed"
+            [[ "$CLEANUP_DRY_RUN" == "true" ]] && cleanup_detail+=" (dry-run)"
+            [[ -n "$ghcr_deleted_url" ]] && cleanup_detail+=" &nbsp;[↗](${ghcr_deleted_url})"
+          fi
+          row "🧹 GHCR cleanup" "$CLEANUP_RESULT" "not enabled" "${cleanup_detail:-ok}" "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Failure marker
+          if [[ "$BUILD_RESULT" == "failure" || "$BUMP_RESULT" == "failure" || "$SYNC_RESULT" == "failure" ]]; then
+            {
+              echo
+              echo "❌ Failed — [view logs](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID})"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  notify:
+    needs: [context, precheck, build, bump, release, sync]
+    if: failure()
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 5
+    env:
+      TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TG_CHAT: ${{ secrets.TELEGRAM_CHAT }}
+      TG_THREAD: ${{ secrets.TELEGRAM_THREAD }}
+    steps:
+      - name: Send Telegram notification
+        if: env.TG_TOKEN != ''
+        uses: appleboy/telegram-action@v1.0.1
+        with:
+          to: ${{ env.TG_CHAT }}
+          token: ${{ env.TG_TOKEN }}
+          message_thread_id: ${{ env.TG_THREAD }}
+          format: markdown
+          disable_web_page_preview: true
+          message: |
+            🔥 *Deploy failed*
+
+            - app: `${{ inputs.team }}/${{ inputs.app }}${{ inputs.component != 'main' && format('/{0}', inputs.component) || '' }}`
+            - env: `${{ needs.context.outputs.env || 'unknown' }}`
+            - repo: `${{ github.repository }}`
+            - branch: `${{ github.ref_name }}`
+            - actor: `${{ github.actor }}`
+
+            [logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
