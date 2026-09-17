@@ -1,0 +1,844 @@
+name: Reusable build, bump, and deploy
+
+on:
+  workflow_call:
+    inputs:
+      # ─── identity ────────────────────────────────────────────────────────────
+      team:
+        description: "Tenant: charts/<team>/<app>/ in charts_repo, label team=<team> on the Application"
+        type: string
+        default: "ecosystem"
+      app:
+        description: "App: charts/<team>/<app>/"
+        type: string
+        required: true
+      components:
+        description: |
+          YAML list, one image per entry:
+            name                   — .components.<name> in chart values; `main` = single-component app
+            docker_context         — build context (default .)
+            docker_file            — Dockerfile path inside docker_context (default Dockerfile)
+            docker_registry        — image without tag (default ghcr.io/<repo>, plus -<name> unless name is `main` or repeats the repo name)
+            docker_build_args      — multiline KEY=VALUE, merged with Vault
+            paths                  — multiline globs (like on.push.paths); build only if a changed file matches
+            chart_init_containers  — multiline initContainer names, get the same image
+            chart_components_extra — multiline other .components.* on the same image
+        type: string
+        required: true
+
+      # ─── docker ──────────────────────────────────────────────────────────────
+      docker_registry_username:
+        description: "Registry user (default github.actor)"
+        type: string
+        default: ""
+      docker_tag:
+        description: "Image tag override (default <UTC>_<branch>_<sha>)"
+        type: string
+        default: ""
+      docker_tags_extra:
+        description: "Multiline extra image tags"
+        type: string
+        default: ""
+      docker_prefix_tag:
+        description: "Monorepo: prefix tags with <app>-"
+        type: boolean
+        default: false
+      docker_latest_branches:
+        description: "Branches that also get the `latest` tag"
+        type: string
+        default: "main,master"
+      docker_cache:
+        description: "buildx cache in GitHub Actions cache"
+        type: boolean
+        default: false
+      docker_image_visibility:
+        description: "Ghcr.io package visibility: private | public. Empty = no check"
+        type: string
+        default: "private"
+
+      # ─── vault (build-args) ──────────────────────────────────────────────────
+      vault_server:
+        description: "Vault URL; build-args read from <vault_mount_args>/<team>/<app>[/<component>]/<env> via OIDC. Empty = off"
+        type: string
+        default: ${{ vars.VAULT_SERVER }}
+      vault_role:
+        description: "JWT role on the auth mount"
+        type: string
+        default: "default"
+      vault_mount_args:
+        description: "KV-v2 mount with build-args, also the JWT auth mount name"
+        type: string
+        default: "gh-actions"
+      vault_mount_envs:
+        description: "KV-v2 mount with runtime envs; only linked from the report. Empty = no link"
+        type: string
+        default: "k8s-workloads"
+
+      # ─── env ─────────────────────────────────────────────────────────────────
+      env:
+        description: "Force env (workflow_dispatch). Empty = from branch"
+        type: string
+        default: ""
+      env_prod_branches:
+        description: "Branches that deploy to env_prod"
+        type: string
+        default: "main,master,release"
+      env_prod:
+        description: "Prod env name"
+        type: string
+        default: "prod"
+      env_default:
+        description: "Env for all other branches"
+        type: string
+        default: "stg"
+
+      # ─── charts repo ─────────────────────────────────────────────────────────
+      charts_repo:
+        description: "GitOps repo with charts/<team>/<app>/. Empty = build only, no bump and no deploy"
+        type: string
+        default: "gear-ops/argocd-workloads"
+      charts_values_path:
+        description: "Values file to bump (default values/<env>.yaml, else values.yaml)"
+        type: string
+        default: ""
+
+      # ─── argocd ──────────────────────────────────────────────────────────────
+      argocd_server:
+        description: "ArgoCD host. Empty = no gate, no sync"
+        type: string
+        default: ${{ vars.ARGOCD_SERVER }}
+      argocd_app:
+        description: "Application name (default: by labels app/env/team)"
+        type: string
+        default: ""
+      argocd_timeout:
+        description: "Seconds to wait for sync + health"
+        type: number
+        default: 600
+
+      # ─── cleanup ─────────────────────────────────────────────────────────────
+      cleanup_enabled:
+        description: "Prune old GHCR versions (keeps latest + docker_tags_extra)"
+        type: boolean
+        default: true
+      cleanup_keep:
+        description: "Versions to keep"
+        type: number
+        default: 3
+
+      # ─── runner ──────────────────────────────────────────────────────────────
+      runs_on:
+        description: "Runner label"
+        type: string
+        default: "ubuntu-latest"
+
+    secrets:
+      DOCKER_REGISTRY_PASSWORD:
+        required: false
+        description: "Non-ghcr registry password"
+      CHARTS_REPO_TOKEN:
+        required: false
+        description: "PAT, contents:write on charts_repo. Required unless charts_repo is empty"
+      ARGOCD_AUTH_TOKEN:
+        required: false
+        description: "ArgoCD API token"
+      TELEGRAM_TOKEN:
+        required: false
+        description: "Bot token for failure alerts"
+      TELEGRAM_CHAT:
+        required: false
+        description: "Chat ID"
+      TELEGRAM_THREAD:
+        required: false
+        description: "Topic ID"
+
+jobs:
+  plan:
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      env: ${{ steps.plan.outputs.env }}
+      tag: ${{ steps.plan.outputs.tag }}
+      created: ${{ steps.plan.outputs.created }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+      skipped: ${{ steps.plan.outputs.skipped }}
+      apps: ${{ steps.apps.outputs.apps }}
+      deploy_enabled: ${{ steps.apps.outputs.deploy_enabled }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Build path filters
+        id: filters
+        if: ${{ github.event_name == 'push' && github.event.forced != true }}
+        env:
+          COMPONENTS: ${{ inputs.components }}
+        run: |
+          set -euo pipefail
+          f=$(yq -o=json '.' <<< "$COMPONENTS" | jq -r '
+            [ .[] | select((.paths // "") != "")
+                  | {(.name): ((.paths|split("\n")|map(sub("^\\s+";"")|sub("\\s+$";""))|map(select(length>0))))} ] | add // {}')
+          if [[ "$(jq 'length' <<< "$f")" == "0" ]]; then echo "▸ no component declares paths — filtering skipped"; exit 0; fi
+          { echo "yaml<<__EOF__"; yq -P '.' <<< "$f"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
+
+      - name: Detect changed components
+        id: changed
+        if: ${{ steps.filters.outputs.yaml != '' }}
+        uses: dorny/paths-filter@v4
+        with:
+          filters: ${{ steps.filters.outputs.yaml }}
+
+      - name: Resolve plan
+        id: plan
+        env:
+          COMPONENTS: ${{ inputs.components }}
+          IN_ENV: ${{ inputs.env }}
+          IN_PROD_BRANCHES: ${{ inputs.env_prod_branches }}
+          IN_PROD_ENV: ${{ inputs.env_prod }}
+          IN_DEFAULT_ENV: ${{ inputs.env_default }}
+          IN_TAG: ${{ inputs.docker_tag }}
+          IN_TAGS_EXTRA: ${{ inputs.docker_tags_extra }}
+          IN_PREFIX_TAG: ${{ inputs.docker_prefix_tag }}
+          IN_LATEST_BRANCHES: ${{ inputs.docker_latest_branches }}
+          IN_APP: ${{ inputs.app }}
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          FILTERED: ${{ steps.changed.outcome == 'success' }}
+          CHANGED: ${{ steps.changed.outputs.changes }}
+          DISPATCH_INPUTS: ${{ toJSON(github.event.inputs) }}
+        run: |
+          set -euo pipefail
+          sanitize() { printf '%s' "$1" | tr -c '[:alnum:]_.-' '-' | tr -s '-'; }
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          in_csv() { local csv="$1" needle="$2" b; IFS=',' read -ra arr <<< "$csv"; for b in "${arr[@]}"; do b=$(strip "$b"); [[ -n "$b" && "$needle" == "$b" ]] && return 0; done; return 1; }
+          emit_empty() { { echo "env="; echo "tag="; echo "matrix=[]"; echo "count=0"; echo "skipped=$1"; } >> "$GITHUB_OUTPUT"; exit 0; }
+
+          if [[ "$REF_TYPE" != "branch" ]]; then
+            echo "▸ ref type '${REF_TYPE}' — only branch pushes are supported"
+            emit_empty "ref type '${REF_TYPE}' is not a branch"
+          fi
+
+          IN_APP=$(strip "$IN_APP")
+          envn=$(strip "$IN_ENV")
+          if [[ -z "$envn" ]]; then
+            if in_csv "$IN_PROD_BRANCHES" "$REF_NAME"; then envn=$(strip "$IN_PROD_ENV"); else envn=$(strip "$IN_DEFAULT_ENV"); fi
+          fi
+
+          # monorepo: app name not in repo name → shared ghcr.io/<repo> image
+          repo_lc=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
+          app_pfx=""; [[ "${REPO#*/}" != *"$IN_APP"* ]] && app_pfx="$IN_APP"
+
+          tag=$(strip "$IN_TAG")
+          if [[ -z "$tag" ]]; then
+            tag="$(date -u +'%Y.%m.%d_%H.%M')_$(sanitize "$REF_NAME")_$(git rev-parse --short HEAD)"
+          else
+            tag=$(sanitize "$tag")
+          fi
+          [[ "$IN_PREFIX_TAG" == "true" && -n "$app_pfx" ]] && tag="${app_pfx}-${tag}"
+
+          latest=""
+          if in_csv "$IN_LATEST_BRANCHES" "$REF_NAME"; then
+            latest="latest"; [[ "$IN_PREFIX_TAG" == "true" && -n "$app_pfx" ]] && latest="${app_pfx}-latest"
+          fi
+
+          [[ "$FILTERED" == "true" ]] && echo "▸ components with changes: ${CHANGED:-[]}"
+
+          comp="${RUNNER_TEMP}/components.json"
+          yq -o=json '.' <<< "$COMPONENTS" > "$comp"
+          n=$(jq 'length' "$comp")
+          [[ "$n" -gt 0 ]] || { echo "::error::inputs.components is empty"; exit 1; }
+          dup=$(jq -r '[.[].name] | group_by(.) | map(select(length>1)[0]) | join(", ")' "$comp")
+          [[ -z "$dup" ]] || { echo "::error::duplicate component names: ${dup}"; exit 1; }
+
+          matrix="[]"; skipped=""
+          for i in $(seq 0 $((n-1))); do
+            c=$(jq -c ".[$i]" "$comp")
+            name=$(jq -r '.name // empty' <<< "$c"); [[ -n "$name" ]] || { echo "::error::components[$i] has no name"; exit 1; }
+            flag_key="deploy"; [[ "$name" != "main" ]] && flag_key="deploy_${name}"
+            flag=$(jq -r --arg k "$flag_key" '.[$k] // empty' <<< "$DISPATCH_INPUTS")
+            if [[ "$EVENT" == "workflow_dispatch" && "$flag" == "false" ]]; then
+              echo "▸ ${name}: ${flag_key}=false — skipped"; skipped+="${name}: unchecked in dispatch; "; continue
+            fi
+
+            paths=$(jq -r '.paths // empty' <<< "$c")
+            if [[ -n "$paths" && "$FILTERED" == "true" ]] \
+               && ! jq -e --arg n "$name" 'index($n)' <<< "${CHANGED:-[]}" >/dev/null; then
+              echo "▸ ${name}: no changed file matches paths — skipped"; skipped+="${name}: no matching changes; "; continue
+            fi
+
+            registry=$(jq -r '.docker_registry // empty' <<< "$c" | tr -d '[:space:]')
+            if [[ -z "$registry" ]]; then
+              registry="ghcr.io/${repo_lc}"
+              [[ "$name" != "main" && "${repo_lc##*/}" != "$name" ]] && registry="${registry}-${name}"
+            fi
+            tags="${registry}:${tag}"
+            [[ -n "$latest" ]] && tags+=$'\n'"${registry}:${latest}"
+            while IFS= read -r t; do
+              t=$(sanitize "$(strip "$t")"); [[ -z "$t" ]] && continue
+              [[ "$IN_PREFIX_TAG" == "true" && -n "$app_pfx" ]] && t="${app_pfx}-${t}"
+              tags+=$'\n'"${registry}:${t}"
+            done <<< "${IN_TAGS_EXTRA:-}"
+
+            entry=$(jq -n --argjson c "$c" --arg registry "$registry" --arg image "${registry}:${tag}" --arg tags "$tags" '{
+              name: $c.name,
+              docker_context: ($c.docker_context // "."),
+              docker_file: ((($c.docker_context // ".") + "/" + ($c.docker_file // "Dockerfile")) | sub("^\\./";"")),
+              label: (if $c.name == "main" then "" else " " + $c.name end),
+              docker_registry: $registry,
+              docker_image: $image,
+              docker_tags: $tags,
+              docker_build_args: ($c.docker_build_args // ""),
+              chart_init_containers: (($c.chart_init_containers // "") | split("\n") | map(gsub("\\s";"")) | map(select(length>0)) | join(",")),
+              chart_components_extra: (($c.chart_components_extra // "") | split("\n") | map(gsub("\\s";"")) | map(select(length>0)) | join(","))
+            }')
+            matrix=$(jq -c --argjson e "$entry" '. + [$e]' <<< "$matrix")
+            echo "▸ ${name}: build → ${registry}:${tag}"
+          done
+
+          clash=$(jq -r '[.[].docker_registry] | group_by(.) | map(select(length>1)[0]) | join(", ")' <<< "$matrix")
+          [[ -z "$clash" ]] || { echo "::error::components share one image, they would overwrite each other: ${clash}. Give each its own docker_registry, or merge them with chart_components_extra"; exit 1; }
+
+          count=$(jq 'length' <<< "$matrix")
+          {
+            echo "env=$envn"
+            echo "tag=$tag"
+            echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "matrix=$matrix"
+            echo "count=$count"
+            echo "skipped=${skipped%; }"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Discover ArgoCD applications
+        id: apps
+        if: ${{ steps.plan.outputs.count != '0' }}
+        env:
+          ARGOCD_SERVER: ${{ inputs.argocd_server }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          APP_OVERRIDE: ${{ inputs.argocd_app }}
+          CHARTS_REPO: ${{ inputs.charts_repo }}
+          APP_NAME: ${{ inputs.app }}
+          TEAM: ${{ inputs.team }}
+          ENV: ${{ steps.plan.outputs.env }}
+        run: |
+          set -euo pipefail
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          ARGOCD_SERVER=$(strip "$ARGOCD_SERVER"); ARGOCD_AUTH_TOKEN=$(strip "$ARGOCD_AUTH_TOKEN"); APP_OVERRIDE=$(strip "$APP_OVERRIDE")
+          emit() { { echo "deploy_enabled=$1"; echo "apps<<__EOF__"; [[ -n "${3:-}" ]] && printf '%s\n' "$3"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"; }
+
+          if [[ -z "$CHARTS_REPO" ]]; then echo "▸ charts_repo not set — build only, no bump and no sync"; emit true 0 ""; exit 0; fi
+          if [[ -z "$ARGOCD_SERVER" ]]; then echo "▸ argocd_server not set — no gate, no sync"; emit true 0 ""; exit 0; fi
+          if [[ -n "$APP_OVERRIDE" ]]; then echo "▸ explicit argocd_app='${APP_OVERRIDE}'"; emit true 1 "$APP_OVERRIDE"; exit 0; fi
+
+          selector="app=$(strip "$APP_NAME"),env=$(strip "$ENV"),team=$(strip "$TEAM")"
+          resp=$(curl -sS -G -w '\n%{http_code}' -H "Authorization: Bearer $ARGOCD_AUTH_TOKEN" \
+            --data-urlencode "selector=${selector}" "https://${ARGOCD_SERVER}/api/v1/applications") || resp=""
+          code=$(printf '%s' "$resp" | tail -n1); body=$(printf '%s' "$resp" | sed '$d')
+          [[ "$code" == "200" ]] || { echo "::error::ArgoCD API returned HTTP ${code:-000} for selector '${selector}'"; exit 1; }
+
+          apps=$(printf '%s' "$body" | jq -r '.items[]?.metadata.name // empty')
+          count=$(printf '%s\n' "$apps" | awk 'NF' | wc -l | tr -d ' ')
+          if [[ -z "$apps" ]]; then
+            echo "::notice::No ArgoCD Application matches '${selector}' — env '${ENV}' is not deployed; nothing to build"
+            emit false 0 ""
+          else
+            emit true "$count" "$apps"
+          fi
+
+  build:
+    name: build${{ matrix.label }}
+    needs: plan
+    if: ${{ needs.plan.outputs.count != '0' && needs.plan.outputs.deploy_enabled == 'true' }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to container registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ matrix.docker_registry }}
+          username: ${{ inputs.docker_registry_username != '' && inputs.docker_registry_username || github.actor }}
+          password: ${{ secrets.DOCKER_REGISTRY_PASSWORD || secrets.GITHUB_TOKEN }}
+
+      - name: Resolve build-args
+        id: args
+        env:
+          STATIC_ARGS: ${{ matrix.docker_build_args }}
+          VAULT_SERVER: ${{ inputs.vault_server }}
+          VAULT_ROLE: ${{ inputs.vault_role }}
+          VAULT_MOUNT_ARGS: ${{ inputs.vault_mount_args }}
+          KV_PATH: ${{ matrix.name == 'main'
+                      && format('{0}/data/{1}/{2}/{3}', inputs.vault_mount_args, inputs.team, inputs.app, needs.plan.outputs.env)
+                      || format('{0}/data/{1}/{2}/{3}/{4}', inputs.vault_mount_args, inputs.team, inputs.app, matrix.name, needs.plan.outputs.env) }}
+          AUDIENCE: https://github.com/${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          VAULT_SERVER=$(strip "$VAULT_SERVER"); VAULT_ROLE=$(strip "$VAULT_ROLE"); KV_PATH=$(strip "$KV_PATH")
+
+          merged="${STATIC_ARGS:-}"
+          status="skipped"; count=0; display_path=""; ui_url=""
+
+          if [[ -n "$VAULT_SERVER" ]]; then
+            display_path="${KV_PATH/\/data\///}"
+            mount="${display_path%%/*}"; rest="${display_path#*/}"
+            ui_url="${VAULT_SERVER}/ui/vault/secrets/${mount}/kv/$(jq -rn --arg s "$rest" '$s|@uri')/details"
+
+            jwt=$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
+            login=$(curl -sSL -w '\n%{http_code}' --data "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${jwt}\"}" \
+              "${VAULT_SERVER}/v1/auth/${VAULT_MOUNT_ARGS}/login")
+            login_code=$(printf '%s' "$login" | tail -n1)
+            token=$(printf '%s' "$login" | sed '$d' | jq -r '.auth.client_token // empty')
+            if [[ -z "$token" ]]; then
+              why=$(printf '%s' "$login" | sed '$d' | jq -r '(.errors // []) | join("; ")' 2>/dev/null)
+              echo "::error::Vault login failed with HTTP ${login_code} for role '${VAULT_ROLE}' on auth mount '${VAULT_MOUNT_ARGS}' with audience '${AUDIENCE}': ${why:-no message}. Check that the role's bound_audiences and bound_claims match this repository, including letter case"
+              exit 1
+            fi
+            echo "::add-mask::$token"
+
+            resp=$(curl -sSL -w '\n%{http_code}' -H "X-Vault-Token: $token" "${VAULT_SERVER}/v1/${KV_PATH}")
+            code=$(printf '%s' "$resp" | tail -n1); body=$(printf '%s' "$resp" | sed '$d')
+            case "$code" in
+              200)
+                status="exists"
+                while IFS= read -r kv; do
+                  [[ -z "$kv" ]] && continue
+                  echo "::add-mask::${kv#*=}"
+                  merged+=$'\n'"$kv"; count=$((count+1))
+                done < <(printf '%s' "$body" | jq -r '.data.data | to_entries[] | "\(.key)=\(.value)"')
+                echo "▸ ${count} build-arg(s) from ${display_path}" ;;
+              404)
+                status="none"; echo "▸ no build-args in Vault at ${display_path} — static args only" ;;
+              *)
+                echo "::error::Vault read ${display_path} returned HTTP ${code}"; exit 1 ;;
+            esac
+          fi
+
+          {
+            echo "merged<<__EOF__"; printf '%s\n' "$merged" | awk 'NF'; echo "__EOF__"
+            echo "va_status=$status"; echo "va_count=$count"; echo "va_path=$display_path"; echo "va_url=$ui_url"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        env:
+          DOCKER_BUILD_SUMMARY: "false"
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: ${{ matrix.docker_context }}
+          file: ${{ matrix.docker_file }}
+          push: true
+          provenance: false
+          tags: ${{ matrix.docker_tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.plan.outputs.tag }}
+            org.opencontainers.image.created=${{ needs.plan.outputs.created }}
+          build-args: ${{ steps.args.outputs.merged }}
+          cache-from: ${{ inputs.docker_cache && 'type=gha' || '' }}
+          cache-to: ${{ inputs.docker_cache && 'type=gha,mode=max' || '' }}
+
+      - name: Verify image visibility
+        if: ${{ inputs.docker_image_visibility != '' && startsWith(matrix.docker_registry, 'ghcr.io/') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY: ${{ matrix.docker_registry }}
+          WANT: ${{ inputs.docker_image_visibility }}
+        run: |
+          set -euo pipefail
+          path=${REGISTRY#ghcr.io/}
+          owner=${path%%/*}
+          pkg=${path#*/}
+          enc=${pkg//\//%2F}
+          got=$(gh api "/orgs/${owner}/packages/container/${enc}" --jq .visibility 2>/dev/null) \
+            || got=$(gh api "/users/${owner}/packages/container/${enc}" --jq .visibility 2>/dev/null) \
+            || { echo "::warning::cannot read visibility of ${REGISTRY}"; exit 0; }
+          if [[ "$got" == "$WANT" ]]; then
+            echo "visibility=${got}"
+            exit 0
+          fi
+          echo "::error::${REGISTRY} is ${got}, expected ${WANT}. Fix it at ${GITHUB_SERVER_URL}/orgs/${owner}/packages/container/${pkg}/settings"
+          exit 1
+
+      - name: Persist build meta
+        if: always()
+        run: |
+          {
+            echo "STATUS=${{ job.status }}"
+            echo "COMPONENT=${{ matrix.name }}"
+            echo "IMAGE=${{ matrix.docker_image }}"
+            echo "INIT_CONTAINERS=${{ matrix.chart_init_containers }}"
+            echo "COMPONENTS_EXTRA=${{ matrix.chart_components_extra }}"
+            echo "VA_STATUS=${{ steps.args.outputs.va_status }}"
+            echo "VA_COUNT=${{ steps.args.outputs.va_count }}"
+            echo "VA_PATH=${{ steps.args.outputs.va_path }}"
+            echo "VA_URL=${{ steps.args.outputs.va_url }}"
+          } > build-meta.env
+
+      - name: Upload build meta
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-meta-${{ inputs.app }}-${{ matrix.name }}
+          path: build-meta.env
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
+
+  cleanup:
+    name: cleanup${{ matrix.label }}
+    needs: [plan, build, bump, sync]
+    if: >-
+      ${{ inputs.cleanup_enabled && (
+            needs.sync.result == 'success'
+            || (inputs.argocd_server == '' && needs.bump.result == 'success')
+            || (inputs.charts_repo == '' && needs.build.result == 'success')
+          ) }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 5
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Resolve cleanup parameters
+        id: pkg
+        env:
+          REGISTRY: ${{ matrix.docker_registry }}
+          TAGS_EXTRA: ${{ inputs.docker_tags_extra }}
+          PREFIX_TAG: ${{ inputs.docker_prefix_tag }}
+          APP: ${{ inputs.app }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          path="${REGISTRY#ghcr.io/}"
+          echo "account=${path%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${path#*/}" >> "$GITHUB_OUTPUT"
+          app_pfx=""; [[ "${REPO#*/}" != *"$APP"* ]] && app_pfx="$APP"
+          if [[ "$PREFIX_TAG" == "true" && -n "$app_pfx" ]]; then
+            protection="${app_pfx}-* !${app_pfx}-latest"
+            while IFS= read -r t; do t="${t//[[:space:]]/}"; [[ -n "$t" ]] && protection+=" !${app_pfx}-${t}"; done <<< "${TAGS_EXTRA:-}"
+          else
+            protection="!latest"
+            while IFS= read -r t; do t="${t//[[:space:]]/}"; [[ -n "$t" ]] && protection+=" !${t}"; done <<< "${TAGS_EXTRA:-}"
+          fi
+          echo "protection=${protection}" >> "$GITHUB_OUTPUT"
+
+      - name: Prune image versions
+        uses: snok/container-retention-policy@v3.1.0
+        with:
+          account: ${{ steps.pkg.outputs.account }}
+          token: ${{ github.token }}
+          image-names: ${{ steps.pkg.outputs.name }}
+          image-tags: ${{ steps.pkg.outputs.protection }}
+          keep-n-most-recent: ${{ inputs.cleanup_keep }}
+          tag-selection: both
+          cut-off: 0s
+
+  bump:
+    needs: [plan, build]
+    if: ${{ inputs.charts_repo != '' && needs.build.result == 'success' }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      values_file: ${{ steps.bump.outputs.values_file }}
+      values_url: ${{ steps.bump.outputs.values_url }}
+      bumped: ${{ steps.bump.outputs.bumped }}
+    steps:
+      - name: Check charts repo token
+        env:
+          TOKEN: ${{ secrets.CHARTS_REPO_TOKEN }}
+        run: |
+          [[ -n "$TOKEN" ]] || { echo "::error::charts_repo is set but secret CHARTS_REPO_TOKEN is empty"; exit 1; }
+
+      - name: Checkout workloads repo
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.charts_repo }}
+          token: ${{ secrets.CHARTS_REPO_TOKEN }}
+          path: workloads
+
+      - name: Download build meta of every component
+        uses: actions/download-artifact@v8
+        with:
+          pattern: build-meta-${{ inputs.app }}-*
+          path: meta
+
+      - name: Bump image tags
+        id: bump
+        working-directory: workloads
+        env:
+          TEAM: ${{ inputs.team }}
+          APP: ${{ inputs.app }}
+          ENV: ${{ needs.plan.outputs.env }}
+          OVERRIDE: ${{ inputs.charts_values_path }}
+          CHARTS_REPO: ${{ inputs.charts_repo }}
+        run: |
+          set -euo pipefail
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          TEAM=$(strip "$TEAM"); APP=$(strip "$APP"); ENV=$(strip "$ENV"); OVERRIDE=$(strip "$OVERRIDE")
+
+          chart_dir="charts/${TEAM}/${APP}"
+          [[ -d "$chart_dir" ]] || { echo "::error::Chart directory '$chart_dir' not found in ${CHARTS_REPO}"; exit 1; }
+          if [[ -n "$OVERRIDE" ]]; then values="$chart_dir/$OVERRIDE"
+          elif [[ -f "$chart_dir/values/${ENV}.yaml" ]]; then values="$chart_dir/values/${ENV}.yaml"
+          else values="$chart_dir/values.yaml"; fi
+          [[ -f "$values" ]] || { echo "::error::Values file '$values' not found"; exit 1; }
+
+          set_image() { # <component> <container-path> <repo> <tag>
+            yq -i ".components.$1.$2.image.repository = \"$3\"" "$values"
+            yq -i ".components.$1.$2.image.tag = \"$4\"" "$values"
+            echo "▸ components.$1.$2 → $3:$4"
+          }
+          require_component() {
+            local v; v=$(yq -r ".components.$1 // \"\"" "$values")
+            [[ -n "$v" && "$v" != "null" ]] || { echo "::error::components.$1 not found in ${values}"; exit 1; }
+          }
+
+          mapfile -t metas < <(find ../meta -name build-meta.env -type f | sort)
+          [[ ${#metas[@]} -gt 0 ]] || { echo "::error::no build-meta artifacts found"; exit 1; }
+
+          bumped=""
+          for f in "${metas[@]}"; do
+            unset STATUS COMPONENT IMAGE INIT_CONTAINERS COMPONENTS_EXTRA
+            # shellcheck disable=SC1090
+            source "$f"
+            [[ "${STATUS:-}" == "success" ]] || continue
+            repo="${IMAGE%:*}"; tag="${IMAGE##*:}"
+            require_component "$COMPONENT"
+            set_image "$COMPONENT" "containers.main" "$repo" "$tag"
+            bumped+="${bumped:+,}${COMPONENT}"
+            IFS=',' read -ra ics <<< "${INIT_CONTAINERS:-}"
+            for ic in "${ics[@]}"; do [[ -n "$ic" ]] && set_image "$COMPONENT" "initContainers.${ic}" "$repo" "$tag"; done
+            IFS=',' read -ra extras <<< "${COMPONENTS_EXTRA:-}"
+            for extra in "${extras[@]}"; do
+              [[ -n "$extra" ]] || continue
+              require_component "$extra"
+              set_image "$extra" "containers.main" "$repo" "$tag"
+              bumped+=",${extra}"
+              for ic in "${ics[@]}"; do
+                [[ -n "$ic" ]] || continue
+                has=$(yq -r ".components.${extra}.initContainers.${ic} // \"\"" "$values")
+                [[ -n "$has" && "$has" != "null" ]] && set_image "$extra" "initContainers.${ic}" "$repo" "$tag"
+              done
+            done
+          done
+          [[ -n "$bumped" ]] || { echo "::error::every component build-meta reports failure — nothing to bump"; exit 1; }
+          bumped=$(tr ',' '\n' <<< "$bumped" | awk 'NF && !seen[$0]++' | paste -sd, -)
+
+          echo "▸ values diff:"; git --no-pager diff "$values" || true
+          {
+            echo "values_file=$values"
+            echo "values_url=https://github.com/${CHARTS_REPO}/blob/main/${values}"
+            echo "bumped=$bumped"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push
+        working-directory: workloads
+        env:
+          MESSAGE: "ci(${{ inputs.team }}/${{ inputs.app }}): ${{ needs.plan.outputs.env }} → ${{ needs.plan.outputs.tag }} [${{ steps.bump.outputs.bumped }}]"
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "$MESSAGE"
+          for i in 1 2 3 4 5; do
+            git pull --rebase --autostash && git push && exit 0
+            echo "▸ push attempt $i failed, retrying"; sleep $((i*3))
+          done
+          echo "::error::could not push the bump commit after 5 attempts"; exit 1
+
+  sync:
+    needs: [plan, bump]
+    if: ${{ inputs.argocd_server != '' && needs.bump.result == 'success' && needs.plan.outputs.apps != '' }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 15
+    outputs:
+      results: ${{ steps.wait.outputs.results }}
+    env:
+      ARGOCD_SERVER: ${{ inputs.argocd_server }}
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      ARGOCD_OPTS: --grpc-web
+    steps:
+      - name: Install argocd CLI
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL -o /usr/local/bin/argocd "https://${ARGOCD_SERVER}/download/argocd-linux-amd64"
+          sudo chmod +x /usr/local/bin/argocd
+          argocd version --client
+
+      - name: Sync and wait for health
+        id: wait
+        env:
+          APPS: ${{ needs.plan.outputs.apps }}
+          TIMEOUT: ${{ inputs.argocd_timeout }}
+        run: |
+          set -euo pipefail
+          mapfile -t apps < <(printf '%s\n' "$APPS" | awk 'NF')
+          rc=0; results=""
+          for app in "${apps[@]}"; do
+            echo ""; echo "▸ $app"
+            if argocd app sync "$app" --timeout "$TIMEOUT" && argocd app wait "$app" --sync --health --timeout "$TIMEOUT"; then
+              results+="${app}|ok"$'\n'
+            else
+              echo "::error::sync/health failed for $app"; results+="${app}|fail"$'\n'; rc=1
+            fi
+          done
+          { echo "results<<__EOF__"; printf '%s' "$results"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
+          exit $rc
+
+  report:
+    needs: [plan, build, cleanup, bump, sync]
+    if: ${{ always() }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 2
+    permissions:
+      actions: read
+    steps:
+      - name: Download build meta
+        uses: actions/download-artifact@v8
+        with:
+          pattern: build-meta-${{ inputs.app }}-*
+          path: meta
+        continue-on-error: true
+
+      - name: Write summary
+        env:
+          TEAM: ${{ inputs.team }}
+          APP: ${{ inputs.app }}
+          ENV: ${{ needs.plan.outputs.env }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          SKIPPED: ${{ needs.plan.outputs.skipped }}
+          DEPLOY_ENABLED: ${{ needs.plan.outputs.deploy_enabled }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          BUMP_RESULT: ${{ needs.bump.result }}
+          BUMP_VALUES: ${{ needs.bump.outputs.values_file }}
+          BUMP_VALUES_URL: ${{ needs.bump.outputs.values_url }}
+          BUMP_LIST: ${{ needs.bump.outputs.bumped }}
+          CHARTS_REPO: ${{ inputs.charts_repo }}
+          SYNC_RESULT: ${{ needs.sync.result }}
+          SYNC_RESULTS: ${{ needs.sync.outputs.results }}
+          CLEANUP_RESULT: ${{ needs.cleanup.result }}
+          CLEANUP_ENABLED: ${{ inputs.cleanup_enabled }}
+          ARGOCD_SERVER: ${{ inputs.argocd_server }}
+          VAULT_SERVER: ${{ inputs.vault_server }}
+          VAULT_MOUNT_ARGS: ${{ inputs.vault_mount_args }}
+          VAULT_MOUNT_ENVS: ${{ inputs.vault_mount_envs }}
+          LOGS: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          S="$GITHUB_STEP_SUMMARY"
+          # per-job log links: .../runs/<run>/job/<job_id>
+          jobs_json=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" \
+            --jq '[.jobs[] | {name, url: .html_url}]' 2>/dev/null || echo '[]')
+          job_url() { jq -r --arg s "$1" 'map(select(.name|endswith($s)))[0].url // empty' <<<"$jobs_json"; }
+          log_link() { local u; u=$(job_url "$1"); echo "[logs](${u:-$LOGS})"; }
+          icon() { case "${1:-skipped}" in success) echo "✅";; failure) echo "❌";; cancelled) echo "⏹";; *) echo "⏭";; esac; }
+          row() { echo "| $1 | $2 | $3 |" >> "$S"; }
+
+          echo "## \`${TEAM}/${APP}\` → \`${ENV:-?}\`${TAG:+ · \`$TAG\`}" >> "$S"
+          if [[ -n "$VAULT_SERVER" ]]; then
+            v="${VAULT_SERVER%/}/ui/vault/secrets"
+            echo "build-args: [\`${VAULT_MOUNT_ARGS}/${TEAM}/${APP}/\`](${v}/${VAULT_MOUNT_ARGS}/kv/list/${TEAM}/${APP}/)  " >> "$S"
+            if [[ -n "$VAULT_MOUNT_ENVS" ]]; then
+              echo "runtime-envs: [\`${VAULT_MOUNT_ENVS}/${TEAM}/${APP}/\`](${v}/${VAULT_MOUNT_ENVS}/kv/list/${TEAM}/${APP}/)  " >> "$S"
+            fi
+          fi
+          echo >> "$S"
+          if [[ "$(jq 'length' <<< "${MATRIX:-[]}")" == "0" ]]; then echo "⏭ nothing to build — ${SKIPPED:-no components selected}" >> "$S"; exit 0; fi
+          if [[ "${DEPLOY_ENABLED:-}" == "false" ]]; then echo "⏭ no ArgoCD Application for env \`${ENV}\` — nothing deployed" >> "$S"; exit 0; fi
+
+          echo "| Stage | Status | Detail |" >> "$S"; echo "| --- | --- | --- |" >> "$S"
+
+          while IFS=$'\t' read -r name image; do
+            [[ -z "$name" ]] && continue
+            st="$BUILD_RESULT"; f="meta/build-meta-${APP}-${name}/build-meta.env"
+            [[ -f "$f" ]] && st=$(sed -n 's/^STATUS=//p' "$f")
+            lbl="build"; [[ "$name" != "main" ]] && lbl="build ${name}"
+            if [[ "$st" == "success" ]]; then row "🐳 Build \`${name}\`" "✅" "\`${image}\`"
+            else row "🐳 Build \`${name}\`" "$(icon "$st")" "$(log_link "$lbl")"; fi
+          done < <(jq -r '.[] | [.name, .docker_image] | @tsv' <<< "${MATRIX:-[]}")
+          while IFS= read -r sk; do sk="${sk#"${sk%%[! ]*}"}"; [[ -z "$sk" ]] && continue; row "🐳 Build \`${sk%%:*}\`" "⏭" "${sk#*: }"; done <<< "${SKIPPED//; /$'\n'}"
+
+          if [[ -n "$CHARTS_REPO" ]]; then
+            bump="—"
+            [[ -n "$BUMP_VALUES" ]] && bump="[\`${BUMP_VALUES}\`](${BUMP_VALUES_URL}) · ${BUMP_LIST//,/, }"
+            [[ "$BUMP_RESULT" == "failure" ]] && bump="$(log_link bump)"
+            row "📝 Bump" "$(icon "$BUMP_RESULT")" "$bump"
+          fi
+
+          if [[ -n "$ARGOCD_SERVER" && -n "$CHARTS_REPO" ]]; then
+            sync=""
+            while IFS='|' read -r a outcome; do
+              [[ -z "$a" ]] && continue
+              mark=""; [[ "$outcome" == "fail" ]] && mark="❌ "
+              sync+="${sync:+, }${mark}[\`${a}\`](https://${ARGOCD_SERVER}/applications/argocd/${a}?operation=true)"
+            done <<< "${SYNC_RESULTS:-}"
+            [[ "$SYNC_RESULT" == "failure" && -z "$sync" ]] && sync="$(log_link sync)"
+            row "🚀 Sync" "$(icon "$SYNC_RESULT")" "${sync:-—}"
+          fi
+
+          if [[ "$CLEANUP_ENABLED" == "true" ]]; then
+            case "$CLEANUP_RESULT" in
+              success) cl="keep ${{ inputs.cleanup_keep }}" ;;
+              failure) cl="$(log_link cleanup)" ;;
+              *)       cl="—" ;;
+            esac
+            row "🧹 Cleanup" "$(icon "$CLEANUP_RESULT")" "$cl"
+          fi
+          true
+
+  notify:
+    needs: [plan, build, bump, sync]
+    if: failure()
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 5
+    env:
+      TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TG_CHAT: ${{ secrets.TELEGRAM_CHAT }}
+      TG_THREAD: ${{ secrets.TELEGRAM_THREAD }}
+    steps:
+      - name: Send Telegram notification
+        if: env.TG_TOKEN != ''
+        uses: appleboy/telegram-action@v1.1.1
+        with:
+          to: ${{ env.TG_CHAT }}
+          token: ${{ env.TG_TOKEN }}
+          message_thread_id: ${{ env.TG_THREAD }}
+          format: markdown
+          disable_web_page_preview: true
+          message: |
+            🔥 *CI/CD failed*
+
+            - app: `${{ inputs.team }}/${{ inputs.app }}`
+            - env: `${{ needs.plan.outputs.env }}`
+            - repo: `${{ github.repository }}`
+            - branch: `${{ github.ref_name }}`
+            - actor: `${{ github.actor }}`
+
+            [logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
