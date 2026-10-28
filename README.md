@@ -4,54 +4,40 @@ Reusable GitHub Actions workflows.
 
 ## build-deploy.yaml
 
-One call per application, one job per component, one commit, one sync.
+Builds a Docker image per component, writes the new tags into a GitOps repo and
+syncs the ArgoCD Application.
 
-```text
-deploy        plan → build → bump → sync → cleanup → report
-gitops only   plan → build → bump ───────→ cleanup → report
-build only    plan → build ──────────────→ cleanup → report
+### Quick start
+
+Build only, the smallest caller, with none of the variables below set:
+
+```yaml
+name: Build
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+  actions: read
+  id-token: write
+
+jobs:
+  build:
+    uses: gear-ops/actions/.github/workflows/build-deploy.yaml@main
+    with:
+      app: example-app
+      components: |
+        - name: main
 ```
 
-| mode | `charts_repo` | `argocd_server` | you get |
-| --- | --- | --- | --- |
-| deploy | set | set | images, a commit in the GitOps repo, a synced Application |
-| gitops only | set | empty | images and the commit, rollout is someone else's job |
-| build only | empty | ignored | images only, and no `CHARTS_REPO_TOKEN` |
+It pushes `ghcr.io/<owner>/<repo>:<tag>`; a public repository also passes
+`docker_image_visibility: public`. All four `permissions` are required in every
+mode: a called workflow gets no more than its caller grants.
 
-| job | runs | when |
-| --- | --- | --- |
-| `plan` | once | always |
-| `build` | per component | a changed file matches its `paths`, and in deploy mode an Application exists |
-| `bump` | once | `charts_repo` set, every build succeeded |
-| `sync` | once | `argocd_server` set, bump succeeded |
-| `cleanup` | once | `cleanup_enabled`, the last stage of the mode succeeded |
-| `report` | once | always |
-| `notify` | once | `plan`, `build`, `bump` or `sync` failed |
-
-### Branch to env
-
-| branch | env |
-| --- | --- |
-| `main`, `master`, `release` | `prod` |
-| anything else | `stg` |
-
-Tags and other refs are ignored. Re-map with `env_prod_branches`, `env_prod` and
-`env_default`; a `workflow_dispatch` run can force `env` directly.
-
-### What it expects from your setup
-
-| piece | needed for | shape |
-| --- | --- | --- |
-| GitOps repo `charts_repo` | deploy, gitops only | `charts/<team>/<app>/values/<env>.yaml`, each component at `.components.<name>.containers.main.image` with `repository` and `tag`; other layouts via `charts_values_path` |
-| ArgoCD Applications | deploy | labels `app`, `env`, `team`, or one name in `argocd_app` |
-| Vault | build-args | a KV-v2 mount and a JWT auth mount sharing the name in `vault_mount_args`, with a role that trusts this repository |
-| Registry | always | `ghcr.io` by default, anything else via `docker_registry` plus `DOCKER_REGISTRY_PASSWORD` |
-
-Vault is orthogonal to the three modes: with `vault_server` empty the step is
-skipped, build-args come only from `docker_build_args`, and the caller does not
-need `id-token: write`.
-
-### Caller
+Deploy, with two components and a manual run:
 
 ```yaml
 name: Build and Deploy
@@ -62,8 +48,8 @@ on:
     paths-ignore: ['.github/**', '**.md']
   workflow_dispatch:
     inputs:
-      env:             { type: choice, options: [prod], required: false }
-      deploy_indexer:  { type: boolean, default: true }   # deploy_<component>
+      env:             { type: choice, options: [prod, stg], required: false }
+      deploy_backend:  { type: boolean, default: true }   # deploy_<component>
       deploy_frontend: { type: boolean, default: true }
 
 concurrency:
@@ -71,10 +57,10 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
   packages: write
-  actions: write
-  id-token: write      # only for build-args from Vault
+  actions: read
+  id-token: write
 
 jobs:
   deploy:
@@ -84,11 +70,11 @@ jobs:
       app: example-app
       env: ${{ inputs.env }}
       components: |
-        - name: indexer
-          docker_context: indexer
-          chart_init_containers: migrate
-          chart_components_extra: graphql
-          paths: indexer/**
+        - name: backend
+          docker_context: backend
+          chart_init_containers: migrations
+          chart_components_extra: worker
+          paths: backend/**
         - name: frontend
           docker_context: frontend
           paths: frontend/**
@@ -97,105 +83,148 @@ jobs:
       ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
 ```
 
-A single-component application names its component `main`; its dispatch flag is
-then just `deploy`.
+`charts_repo` and `argocd_server` come from the variables below.
 
-### Component keys
+### Modes
 
-| key | needed | default | what it does |
-| --- | --- | --- | --- |
-| `name` | always | | `.components.<name>` in chart values; `main` for a single-component app |
-| `docker_context` | optional | `.` | build context |
-| `docker_file` | optional | `Dockerfile` | Dockerfile path inside the context |
-| `docker_registry` | optional | see below | image without tag |
-| `docker_build_args` | optional | | multiline `KEY=VALUE`, merged under the ones from Vault |
-| `paths` | optional | | multiline globs; the component builds only if a changed file matches |
-| `chart_init_containers` | optional | | initContainers that get the same image |
-| `chart_components_extra` | optional | | other `.components.*` that get the same image |
-
-Default image name:
-
-| component | image |
-| --- | --- |
-| `main` | `ghcr.io/<owner>/<repo>` |
-| named after the repo | `ghcr.io/<owner>/<repo>` |
-| anything else | `ghcr.io/<owner>/<repo>-<name>` |
-
-Two components resolving to the same image would overwrite each other, so `plan`
-refuses to start: give one its own `docker_registry`, or merge them with
-`chart_components_extra`.
-
-### Variables and secrets on the calling repo
-
-| variable | needed | what it is |
+| mode | set | you get |
 | --- | --- | --- |
-| `ARGOCD_SERVER` | to deploy | ArgoCD host, e.g. `argocd.example.com` |
-| `VAULT_SERVER` | for build-args | Vault URL, e.g. `https://vault.example.com` |
+| build only | nothing | images |
+| gitops only | `charts_repo` | images and a commit in the GitOps repo |
+| deploy | `charts_repo`, `argocd_server` | images, the commit and a synced Application |
 
-| secret | needed | what it is |
+Build-args from Vault work in any mode once `vault_server` is set.
+
+### Variables and secrets
+
+Set variables on the organization or the repository; a repository variable
+overrides an organization one, and an input of the same name in lower case
+overrides both.
+
+| variable | needed for | example |
 | --- | --- | --- |
-| `CHARTS_REPO_TOKEN` | to deploy | token with `contents:write` on `charts_repo` |
-| `ARGOCD_AUTH_TOKEN` | to deploy | ArgoCD API token allowed to sync those Applications |
-| `DOCKER_REGISTRY_PASSWORD` | optional | only for a registry other than `ghcr.io` |
+| `TEAM` | GitOps repo, Vault | `example-team` |
+| `CHARTS_REPO` | gitops only, deploy | `example-org/gitops` |
+| `ARGOCD_SERVER` | deploy | `argocd.example.com` |
+| `VAULT_SERVER` | Vault | `https://vault.example.com` |
+| `VAULT_AUTH_PATH` | Vault | `github` |
+| `VAULT_ROLE` | Vault | `example-org` |
+| `VAULT_MOUNT_CI` | Vault | `example-org-ci` |
+| `VAULT_MOUNT_RUNTIME` | optional, a link in the report | `example-org-runtime` |
+
+| secret | needed for | what it is |
+| --- | --- | --- |
+| `CHARTS_REPO_TOKEN` | gitops only, deploy | token with `contents:write` on `charts_repo` |
+| `ARGOCD_AUTH_TOKEN` | deploy | ArgoCD API token that can list and sync the Applications |
+| `DOCKER_REGISTRY_PASSWORD` | a registry other than `ghcr.io` | registry password |
 | `TELEGRAM_TOKEN`, `TELEGRAM_CHAT`, `TELEGRAM_THREAD` | optional | failure alerts |
 
-Both variables only fill the defaults of the `argocd_server` and `vault_server`
-inputs, so a caller may pass those directly instead.
+### Components
 
-### What bump writes
+`components` is a YAML list, one image per entry. A single-component app names
+its component `main`.
 
-One tag per run, computed once in `plan` as `<UTC timestamp>_<branch>_<short sha>`:
+| key | default | what it does |
+| --- | --- | --- |
+| `name` | required | `.components.<name>` in chart values |
+| `docker_context` | `.` | build context |
+| `docker_file` | `Dockerfile` | Dockerfile path inside the context |
+| `docker_registry` | `ghcr.io/<owner>/<repo>-<name>`; without `-<name>` for `main` or a component named after the repo | image without tag |
+| `docker_build_args` | | multiline `KEY=VALUE`; Vault wins on the same key |
+| `paths` | | multiline globs; on a push the component builds only if a changed file matches |
+| `chart_init_containers` | | initContainers that get the same image |
+| `chart_components_extra` | | other `.components.*` that get the same image |
+
+Two components with the same image would overwrite each other, so the run stops:
+give one its own `docker_registry`, or merge them with `chart_components_extra`.
+
+### Other inputs
+
+| input | default | what it does |
+| --- | --- | --- |
+| `env` | from the branch | force the environment |
+| `env_prod_branches` | `main,master,release` | branches that deploy to `env_prod` |
+| `env_prod` | `prod` | environment of those branches |
+| `env_default` | `stg` | environment of every other branch |
+| `docker_registry_username` | `github.actor` | registry login |
+| `docker_tag` | `<UTC timestamp>_<branch>_<short sha>` | image tag |
+| `docker_tags_extra` | | multiline extra tags, kept by cleanup |
+| `docker_prefix_tag` | `false` | monorepo: prefix tags with `<app>-` |
+| `docker_latest_branches` | `main,master` | branches that also push `latest` |
+| `docker_cache` | `false` | buildx cache in the GitHub Actions cache |
+| `docker_image_visibility` | `private` | fail if the `ghcr.io` package is not this; `public` for a public repository, empty to skip |
+| `charts_values_path` | `values/<env>.yaml`, else `values.yaml` | values file inside `charts/<team>/<app>/` |
+| `argocd_app` | by labels | Application name instead of the label lookup |
+| `argocd_timeout` | `600` | seconds to wait for sync and health |
+| `cleanup_enabled` | `true` | prune old `ghcr.io` versions |
+| `cleanup_keep` | `3` | versions to keep per image |
+| `runs_on` | `ubuntu-latest` | runner label |
+
+### What a run does
+
+1. `plan` picks the environment from the branch (tags are ignored), the tag and
+   the components to build: a manual run skips unchecked `deploy_<component>`,
+   a push skips components whose `paths` did not change. In deploy mode nothing
+   is built if no Application has the labels `app`, `env` and `team`.
+2. `build` builds and pushes each component, with build-args from
+   `docker_build_args` and Vault.
+3. `bump` writes the tag into the GitOps repo and pushes one commit.
+4. `sync` syncs the Applications and waits until they are healthy.
+5. `cleanup` keeps the last `cleanup_keep` versions of each `ghcr.io` image.
+6. `report` writes the run summary; `notify` sends a Telegram alert when `plan`,
+   `build`, `bump` or `sync` fails.
+
+### GitOps repo
+
+`bump` edits `charts/<team>/<app>/values/<env>.yaml`:
 
 ```yaml
-# charts/example-team/example-app/values/prod.yaml
 components:
-  indexer:                       # name
+  backend:                       # name
     containers:
       main:
         image:
-          repository: ghcr.io/example-org/example-app-indexer
+          repository: ghcr.io/example-org/example-app-backend
           tag: 2026.09.17_10.15_main_1a2b3c4
     initContainers:
-      migrate:                   # chart_init_containers
+      migrations:                # chart_init_containers
         image: { repository: same, tag: same }
-  graphql:                       # chart_components_extra
+  worker:                        # chart_components_extra
     containers:
       main:
         image: { repository: same, tag: same }
 ```
 
 The commit is plain `git`, so the token never reaches a third-party action.
+`sync` downloads the `argocd` CLI from `argocd_server`, so the runner must reach it.
 
-Build-args are read from `<vault_mount_args>/<team>/<app>[/<component>]/<env>`
-over GitHub OIDC. A missing path means the component has no build-args there;
-any other Vault error fails the build.
+### Vault
 
-### Image visibility
+Build-args are read from `<vault_mount_ci>/<team>/<app>[/<component>]/<env>`
+(no `/<component>` for `main`). Vault needs:
 
-| `docker_image_visibility` | effect after each push to `ghcr.io` |
-| --- | --- |
-| `private` (default) | the build fails if the package ended up public |
-| `public` | the build fails if the package ended up private |
-| empty | no check |
+- a JWT auth method at `auth/<vault_auth_path>` for the issuer
+  `https://token.actions.githubusercontent.com`;
+- a role `vault_role` that accepts the audience `https://github.com/<owner>` and
+  this repository, with read on `<vault_mount_ci>/data/*`.
 
-It is a check, not a setting. An image pushed with `GITHUB_TOKEN` inherits the
-visibility of its repository, and neither the REST API nor GraphQL can change it
-afterwards, so a package is fixed once on its settings page.
+A missing path means no build-args; any other Vault error fails the build.
 
-### Cleanup
+### Notes
 
-Keeps `cleanup_keep` versions per image, protecting `latest` and everything in
-`docker_tags_extra`. One job prunes every image of the run at once, so all
-components must live under the same registry account; the job stops with a clear
-message otherwise. Only images built in that run are pruned, so a component
-skipped by its `paths` filter keeps its old versions until it builds again.
+- Visibility: an image pushed with `GITHUB_TOKEN` takes the visibility of its
+  repository and no API can change it, so a wrong one is fixed once by hand on
+  the package settings page; the check only reports it.
+- Cleanup prunes only images built in the run, all under one `ghcr.io` account,
+  and keeps `latest` and `docker_tags_extra`.
 
 ## Actions used
 
 | action | why |
 | --- | --- |
-| `dorny/paths-filter` | per-component `paths` filter against the push diff |
+| `actions/checkout` | the source and the GitOps repo |
+| `dorny/paths-filter` | per-component `paths` filter |
 | `docker/setup-buildx-action`, `docker/login-action`, `docker/build-push-action` | build and push |
-| `actions/upload-artifact`, `actions/download-artifact` | carry each component's result into the single bump job |
-| `snok/container-retention-policy` | GHCR prune; unlike `actions/delete-package-versions` it filters by image tag, so `latest` stays protected |
-| `appleboy/telegram-action` | failure notification |
+| `actions/upload-artifact`, `actions/download-artifact` | component results for bump and report |
+| `snok/container-retention-policy` | GHCR prune by tag, so `latest` stays protected |
+| `appleboy/telegram-action` | failure alert |

@@ -5,9 +5,9 @@ on:
     inputs:
       # ─── identity ────────────────────────────────────────────────────────────
       team:
-        description: "Tenant: charts/<team>/<app>/ in charts_repo, label team=<team> on the Application"
+        description: "Tenant: charts/<team>/<app>/ in charts_repo, label team=<team> on the Application, <team>/ in Vault paths"
         type: string
-        default: "ecosystem"
+        default: ${{ vars.TEAM }}
       app:
         description: "App: charts/<team>/<app>/"
         type: string
@@ -52,27 +52,31 @@ on:
         type: boolean
         default: false
       docker_image_visibility:
-        description: "Ghcr.io package visibility: private | public. Empty = no check"
+        description: "ghcr.io package visibility: private | public. Empty = no check"
         type: string
         default: "private"
 
       # ─── vault (build-args) ──────────────────────────────────────────────────
       vault_server:
-        description: "Vault URL; build-args read from <vault_mount_args>/<team>/<app>[/<component>]/<env> via OIDC. Empty = off"
+        description: "Vault URL; build-args read from <vault_mount_ci>/<team>/<app>[/<component>]/<env> via OIDC. Empty = off"
         type: string
         default: ${{ vars.VAULT_SERVER }}
+      vault_auth_path:
+        description: "Path of the JWT auth method for GitHub OIDC, auth/<vault_auth_path>; needed with vault_server"
+        type: string
+        default: ${{ vars.VAULT_AUTH_PATH }}
       vault_role:
-        description: "JWT role on the auth mount"
+        description: "Role on auth/<vault_auth_path>; needed with vault_server"
         type: string
-        default: "default"
-      vault_mount_args:
-        description: "KV-v2 mount with build-args, also the JWT auth mount name"
+        default: ${{ vars.VAULT_ROLE }}
+      vault_mount_ci:
+        description: "KV-v2 mount with build-args; needed with vault_server"
         type: string
-        default: "gh-actions"
-      vault_mount_envs:
-        description: "KV-v2 mount with runtime envs; only linked from the report. Empty = no link"
+        default: ${{ vars.VAULT_MOUNT_CI }}
+      vault_mount_runtime:
+        description: "KV-v2 mount with the runtime envs; only linked from the report. Empty = no link"
         type: string
-        default: "k8s-workloads"
+        default: ${{ vars.VAULT_MOUNT_RUNTIME }}
 
       # ─── env ─────────────────────────────────────────────────────────────────
       env:
@@ -96,9 +100,9 @@ on:
       charts_repo:
         description: "GitOps repo with charts/<team>/<app>/. Empty = build only, no bump and no deploy"
         type: string
-        default: "gear-ops/argocd-workloads"
+        default: ${{ vars.CHARTS_REPO }}
       charts_values_path:
-        description: "Values file to bump (default values/<env>.yaml, else values.yaml)"
+        description: "Values file to bump, relative to charts/<team>/<app>/ (default values/<env>.yaml, else values.yaml)"
         type: string
         default: ""
 
@@ -204,6 +208,9 @@ jobs:
           IN_PREFIX_TAG: ${{ inputs.docker_prefix_tag }}
           IN_LATEST_BRANCHES: ${{ inputs.docker_latest_branches }}
           IN_APP: ${{ inputs.app }}
+          IN_TEAM: ${{ inputs.team }}
+          IN_CHARTS_REPO: ${{ inputs.charts_repo }}
+          IN_VAULT_SERVER: ${{ inputs.vault_server }}
           EVENT: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
@@ -224,6 +231,9 @@ jobs:
           fi
 
           IN_APP=$(strip "$IN_APP")
+          if [[ -z "$(strip "$IN_TEAM")" && -n "$(strip "$IN_CHARTS_REPO$IN_VAULT_SERVER")" ]]; then
+            echo "::error::charts_repo or vault_server is set, so team is needed too - set the variable TEAM on the organization or the repository, or pass the input"; exit 1
+          fi
           envn=$(strip "$IN_ENV")
           if [[ -z "$envn" ]]; then
             if in_csv "$IN_PROD_BRANCHES" "$REF_NAME"; then envn=$(strip "$IN_PROD_ENV"); else envn=$(strip "$IN_DEFAULT_ENV"); fi
@@ -332,6 +342,7 @@ jobs:
 
           if [[ -z "$CHARTS_REPO" ]]; then echo "▸ charts_repo not set — build only, no bump and no sync"; emit true 0 ""; exit 0; fi
           if [[ -z "$ARGOCD_SERVER" ]]; then echo "▸ argocd_server not set — no gate, no sync"; emit true 0 ""; exit 0; fi
+          [[ -n "$ARGOCD_AUTH_TOKEN" ]] || { echo "::error::argocd_server is set but secret ARGOCD_AUTH_TOKEN is empty"; exit 1; }
           if [[ -n "$APP_OVERRIDE" ]]; then echo "▸ explicit argocd_app='${APP_OVERRIDE}'"; emit true 1 "$APP_OVERRIDE"; exit 0; fi
 
           selector="app=$(strip "$APP_NAME"),env=$(strip "$ENV"),team=$(strip "$TEAM")"
@@ -383,33 +394,36 @@ jobs:
           STATIC_ARGS: ${{ matrix.docker_build_args }}
           VAULT_SERVER: ${{ inputs.vault_server }}
           VAULT_ROLE: ${{ inputs.vault_role }}
-          VAULT_MOUNT_ARGS: ${{ inputs.vault_mount_args }}
+          VAULT_AUTH_PATH: ${{ inputs.vault_auth_path }}
+          VAULT_MOUNT_CI: ${{ inputs.vault_mount_ci }}
           KV_PATH: ${{ matrix.name == 'main'
-                      && format('{0}/data/{1}/{2}/{3}', inputs.vault_mount_args, inputs.team, inputs.app, needs.plan.outputs.env)
-                      || format('{0}/data/{1}/{2}/{3}/{4}', inputs.vault_mount_args, inputs.team, inputs.app, matrix.name, needs.plan.outputs.env) }}
-          AUDIENCE: https://github.com/${{ github.repository_owner }}
+                      && format('{0}/data/{1}/{2}/{3}', inputs.vault_mount_ci, inputs.team, inputs.app, needs.plan.outputs.env)
+                      || format('{0}/data/{1}/{2}/{3}/{4}', inputs.vault_mount_ci, inputs.team, inputs.app, matrix.name, needs.plan.outputs.env) }}
+          AUDIENCE: ${{ github.server_url }}/${{ github.repository_owner }}
         run: |
           set -euo pipefail
           strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
-          VAULT_SERVER=$(strip "$VAULT_SERVER"); VAULT_ROLE=$(strip "$VAULT_ROLE"); KV_PATH=$(strip "$KV_PATH")
+          VAULT_SERVER=$(strip "$VAULT_SERVER"); VAULT_SERVER=${VAULT_SERVER%/}; VAULT_ROLE=$(strip "$VAULT_ROLE"); KV_PATH=$(strip "$KV_PATH")
 
           merged="${STATIC_ARGS:-}"
-          status="skipped"; count=0; display_path=""; ui_url=""
 
           if [[ -n "$VAULT_SERVER" ]]; then
+            VAULT_AUTH_PATH=$(strip "$VAULT_AUTH_PATH"); VAULT_MOUNT_CI=$(strip "$VAULT_MOUNT_CI")
+            if [[ -z "$VAULT_AUTH_PATH" || -z "$VAULT_ROLE" || -z "$VAULT_MOUNT_CI" ]]; then
+              echo "::error::vault_server is set, so vault_auth_path, vault_role and vault_mount_ci are needed too - set the variables VAULT_AUTH_PATH, VAULT_ROLE and VAULT_MOUNT_CI on the organization or the repository, or pass the inputs"
+              exit 1
+            fi
             display_path="${KV_PATH/\/data\///}"
-            mount="${display_path%%/*}"; rest="${display_path#*/}"
-            ui_url="${VAULT_SERVER}/ui/vault/secrets/${mount}/kv/$(jq -rn --arg s "$rest" '$s|@uri')/details"
 
             jwt=$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
               "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
             login=$(curl -sSL -w '\n%{http_code}' --data "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${jwt}\"}" \
-              "${VAULT_SERVER}/v1/auth/${VAULT_MOUNT_ARGS}/login")
+              "${VAULT_SERVER}/v1/auth/${VAULT_AUTH_PATH}/login")
             login_code=$(printf '%s' "$login" | tail -n1)
-            token=$(printf '%s' "$login" | sed '$d' | jq -r '.auth.client_token // empty')
+            token=$(printf '%s' "$login" | sed '$d' | jq -r '.auth.client_token // empty' 2>/dev/null || true)
             if [[ -z "$token" ]]; then
-              why=$(printf '%s' "$login" | sed '$d' | jq -r '(.errors // []) | join("; ")' 2>/dev/null)
-              echo "::error::Vault login failed with HTTP ${login_code} for role '${VAULT_ROLE}' on auth mount '${VAULT_MOUNT_ARGS}' with audience '${AUDIENCE}': ${why:-no message}. Check that the role's bound_audiences and bound_claims match this repository, including letter case"
+              why=$(printf '%s' "$login" | sed '$d' | jq -r '(.errors // []) | join("; ")' 2>/dev/null || true)
+              echo "::error::Vault login failed with HTTP ${login_code} for role '${VAULT_ROLE}' on auth path '${VAULT_AUTH_PATH}' with audience '${AUDIENCE}': ${why:-no message}. Check that the role's bound_audiences and bound_claims match this repository, including letter case"
               exit 1
             fi
             echo "::add-mask::$token"
@@ -418,7 +432,7 @@ jobs:
             code=$(printf '%s' "$resp" | tail -n1); body=$(printf '%s' "$resp" | sed '$d')
             case "$code" in
               200)
-                status="exists"
+                count=0
                 while IFS= read -r kv; do
                   [[ -z "$kv" ]] && continue
                   echo "::add-mask::${kv#*=}"
@@ -426,16 +440,13 @@ jobs:
                 done < <(printf '%s' "$body" | jq -r '.data.data | to_entries[] | "\(.key)=\(.value)"')
                 echo "▸ ${count} build-arg(s) from ${display_path}" ;;
               404)
-                status="none"; echo "▸ no build-args in Vault at ${display_path} — static args only" ;;
+                echo "▸ no build-args in Vault at ${display_path} — static args only" ;;
               *)
                 echo "::error::Vault read ${display_path} returned HTTP ${code}"; exit 1 ;;
             esac
           fi
 
-          {
-            echo "merged<<__EOF__"; printf '%s\n' "$merged" | awk 'NF'; echo "__EOF__"
-            echo "va_status=$status"; echo "va_count=$count"; echo "va_path=$display_path"; echo "va_url=$ui_url"
-          } >> "$GITHUB_OUTPUT"
+          { echo "merged<<__EOF__"; printf '%s\n' "$merged" | awk 'NF'; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
         uses: docker/build-push-action@v7
@@ -469,14 +480,15 @@ jobs:
           owner=${path%%/*}
           pkg=${path#*/}
           enc=${pkg//\//%2F}
+          kind=orgs
           got=$(gh api "/orgs/${owner}/packages/container/${enc}" --jq .visibility 2>/dev/null) \
-            || got=$(gh api "/users/${owner}/packages/container/${enc}" --jq .visibility 2>/dev/null) \
+            || { kind=users; got=$(gh api "/users/${owner}/packages/container/${enc}" --jq .visibility 2>/dev/null); } \
             || { echo "::warning::cannot read visibility of ${REGISTRY}"; exit 0; }
           if [[ "$got" == "$WANT" ]]; then
             echo "visibility=${got}"
             exit 0
           fi
-          echo "::error::${REGISTRY} is ${got}, expected ${WANT}. Fix it at ${GITHUB_SERVER_URL}/orgs/${owner}/packages/container/${pkg}/settings"
+          echo "::error::${REGISTRY} is ${got}, expected ${WANT}. Fix it at ${GITHUB_SERVER_URL}/${kind}/${owner}/packages/container/${enc}/settings"
           exit 1
 
       - name: Persist build meta
@@ -488,10 +500,6 @@ jobs:
             echo "IMAGE=${{ matrix.docker_image }}"
             echo "INIT_CONTAINERS=${{ matrix.chart_init_containers }}"
             echo "COMPONENTS_EXTRA=${{ matrix.chart_components_extra }}"
-            echo "VA_STATUS=${{ steps.args.outputs.va_status }}"
-            echo "VA_COUNT=${{ steps.args.outputs.va_count }}"
-            echo "VA_PATH=${{ steps.args.outputs.va_path }}"
-            echo "VA_URL=${{ steps.args.outputs.va_url }}"
           } > build-meta.env
 
       - name: Upload build meta
@@ -507,7 +515,7 @@ jobs:
   cleanup:
     needs: [plan, build, bump, sync]
     if: >-
-      ${{ inputs.cleanup_enabled && (
+      ${{ !cancelled() && inputs.cleanup_enabled && (
             needs.sync.result == 'success'
             || (inputs.argocd_server == '' && needs.bump.result == 'success')
             || (inputs.charts_repo == '' && needs.build.result == 'success')
@@ -525,16 +533,20 @@ jobs:
           PREFIX_TAG: ${{ inputs.docker_prefix_tag }}
           APP: ${{ inputs.app }}
           REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mapfile -t regs < <(jq -r '.[].docker_registry' <<< "$MATRIX" | sort -u)
+          mapfile -t regs < <(jq -r '.[].docker_registry | select(startswith("ghcr.io/"))' <<< "$MATRIX" | sort -u)
+          if [[ ${#regs[@]} -eq 0 ]]; then echo "▸ no ghcr.io image in this run — nothing to prune"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; fi
           mapfile -t accounts < <(printf '%s\n' "${regs[@]}" | sed 's|^ghcr.io/||; s|/.*||' | sort -u)
           if [[ ${#accounts[@]} -ne 1 ]]; then
             echo "::error::components span several registry accounts (${accounts[*]}); cleanup supports one"
             exit 1
           fi
           names=$(printf '%s\n' "${regs[@]}" | sed 's|^ghcr.io/[^/]*/||' | paste -sd' ' -)
-          echo "account=${accounts[0]}" >> "$GITHUB_OUTPUT"
+          account=${accounts[0]}
+          [[ "$(gh api "users/${account}" --jq .type)" == "User" ]] && account=user
+          echo "account=${account}" >> "$GITHUB_OUTPUT"
           echo "name=${names}" >> "$GITHUB_OUTPUT"
           echo "▸ pruning: ${names}"
           app_pfx=""; [[ "${REPO#*/}" != *"$APP"* ]] && app_pfx="$APP"
@@ -548,6 +560,7 @@ jobs:
           echo "protection=${protection}" >> "$GITHUB_OUTPUT"
 
       - name: Prune image versions
+        if: ${{ steps.pkg.outputs.skip != 'true' }}
         uses: snok/container-retention-policy@v3.1.0
         with:
           account: ${{ steps.pkg.outputs.account }}
@@ -654,7 +667,7 @@ jobs:
           echo "▸ values diff:"; git --no-pager diff "$values" || true
           {
             echo "values_file=$values"
-            echo "values_url=https://github.com/${CHARTS_REPO}/blob/main/${values}"
+            echo "values_url=${GITHUB_SERVER_URL}/${CHARTS_REPO}/blob/HEAD/${values}"
             echo "bumped=$bumped"
           } >> "$GITHUB_OUTPUT"
 
@@ -666,6 +679,7 @@ jobs:
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then echo "▸ values already carry this tag — nothing to commit"; exit 0; fi
           git commit -am "$MESSAGE"
           for i in 1 2 3 4 5; do
             git pull --rebase --autostash && git push && exit 0
@@ -678,6 +692,7 @@ jobs:
     if: ${{ inputs.argocd_server != '' && needs.bump.result == 'success' && needs.plan.outputs.apps != '' }}
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 15
+    permissions: {}
     outputs:
       results: ${{ steps.wait.outputs.results }}
     env:
@@ -688,9 +703,16 @@ jobs:
       - name: Install argocd CLI
         run: |
           set -euo pipefail
-          sudo curl -fsSL -o /usr/local/bin/argocd "https://${ARGOCD_SERVER}/download/argocd-linux-amd64"
-          sudo chmod +x /usr/local/bin/argocd
-          argocd version --client
+          case "$(uname -m)" in
+            x86_64) arch=amd64 ;;
+            aarch64|arm64) arch=arm64 ;;
+            *) echo "::error::no argocd CLI for runner architecture $(uname -m)"; exit 1 ;;
+          esac
+          mkdir -p "${RUNNER_TEMP}/bin"
+          curl -fsSL -o "${RUNNER_TEMP}/bin/argocd" "https://${ARGOCD_SERVER}/download/argocd-linux-${arch}"
+          chmod +x "${RUNNER_TEMP}/bin/argocd"
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/bin/argocd" version --client
 
       - name: Sync and wait for health
         id: wait
@@ -733,6 +755,7 @@ jobs:
           APP: ${{ inputs.app }}
           ENV: ${{ needs.plan.outputs.env }}
           TAG: ${{ needs.plan.outputs.tag }}
+          PLAN_RESULT: ${{ needs.plan.result }}
           MATRIX: ${{ needs.plan.outputs.matrix }}
           SKIPPED: ${{ needs.plan.outputs.skipped }}
           DEPLOY_ENABLED: ${{ needs.plan.outputs.deploy_enabled }}
@@ -748,8 +771,8 @@ jobs:
           CLEANUP_ENABLED: ${{ inputs.cleanup_enabled }}
           ARGOCD_SERVER: ${{ inputs.argocd_server }}
           VAULT_SERVER: ${{ inputs.vault_server }}
-          VAULT_MOUNT_ARGS: ${{ inputs.vault_mount_args }}
-          VAULT_MOUNT_ENVS: ${{ inputs.vault_mount_envs }}
+          VAULT_MOUNT_CI: ${{ inputs.vault_mount_ci }}
+          VAULT_MOUNT_RUNTIME: ${{ inputs.vault_mount_runtime }}
           LOGS: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -763,12 +786,15 @@ jobs:
           icon() { case "${1:-skipped}" in success) echo "✅";; failure) echo "❌";; cancelled) echo "⏹";; *) echo "⏭";; esac; }
           row() { echo "| $1 | $2 | $3 |" >> "$S"; }
 
-          echo "## \`${TEAM}/${APP}\` → \`${ENV:-?}\`${TAG:+ · \`$TAG\`}" >> "$S"
+          echo "## \`${TEAM:+$TEAM/}${APP}\` → \`${ENV:-?}\`${TAG:+ · \`$TAG\`}" >> "$S"
+          if [[ "$PLAN_RESULT" != "success" ]]; then echo "$(icon "$PLAN_RESULT") plan ${PLAN_RESULT} — $(log_link plan)" >> "$S"; exit 0; fi
           if [[ -n "$VAULT_SERVER" ]]; then
             v="${VAULT_SERVER%/}/ui/vault/secrets"
-            echo "build-args: [\`${VAULT_MOUNT_ARGS}/${TEAM}/${APP}/\`](${v}/${VAULT_MOUNT_ARGS}/kv/list/${TEAM}/${APP}/)  " >> "$S"
-            if [[ -n "$VAULT_MOUNT_ENVS" ]]; then
-              echo "runtime-envs: [\`${VAULT_MOUNT_ENVS}/${TEAM}/${APP}/\`](${v}/${VAULT_MOUNT_ENVS}/kv/list/${TEAM}/${APP}/)  " >> "$S"
+            if [[ -n "$VAULT_MOUNT_CI" ]]; then
+              echo "build-args: [\`${VAULT_MOUNT_CI}/${TEAM}/${APP}/\`](${v}/${VAULT_MOUNT_CI}/kv/list/${TEAM}/${APP}/)  " >> "$S"
+            fi
+            if [[ -n "$VAULT_MOUNT_RUNTIME" ]]; then
+              echo "runtime-envs: [\`${VAULT_MOUNT_RUNTIME}/${TEAM}/${APP}/\`](${v}/${VAULT_MOUNT_RUNTIME}/kv/list/${TEAM}/${APP}/)  " >> "$S"
             fi
           fi
           echo >> "$S"
@@ -820,6 +846,7 @@ jobs:
     if: failure()
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 5
+    permissions: {}
     env:
       TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TG_CHAT: ${{ secrets.TELEGRAM_CHAT }}
@@ -837,10 +864,10 @@ jobs:
           message: |
             🔥 *CI/CD failed*
 
-            - app: `${{ inputs.team }}/${{ inputs.app }}`
+            - app: `${{ inputs.team != '' && format('{0}/{1}', inputs.team, inputs.app) || inputs.app }}`
             - env: `${{ needs.plan.outputs.env }}`
             - repo: `${{ github.repository }}`
             - branch: `${{ github.ref_name }}`
             - actor: `${{ github.actor }}`
 
-            [logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            [logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
