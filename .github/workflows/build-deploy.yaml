@@ -162,6 +162,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      id-token: write
     outputs:
       env: ${{ steps.plan.outputs.env }}
       tag: ${{ steps.plan.outputs.tag }}
@@ -323,12 +324,48 @@ jobs:
             echo "skipped=${skipped%; }"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Read CI credentials from Vault
+        if: ${{ steps.plan.outputs.count != '0' }}
+        env:
+          VAULT_SERVER: ${{ inputs.vault_server }}
+          VAULT_ROLE: ${{ inputs.vault_role }}
+          VAULT_AUTH_PATH: ${{ inputs.vault_auth_path }}
+          VAULT_MOUNT_CI: ${{ inputs.vault_mount_ci }}
+          AUDIENCE: ${{ github.server_url }}/${{ github.repository_owner }}
+          WANT: ARGOCD_AUTH_TOKEN
+          FALLBACK_ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          export_env() { # <name> <value>: masked, multi-line safe
+            while IFS= read -r line; do [[ -n "$line" ]] && echo "::add-mask::$line"; done <<< "$2"
+            local delim; delim="EOF_$(openssl rand -hex 8)"
+            { echo "$1<<$delim"; printf '%s\n' "$2"; echo "$delim"; } >> "$GITHUB_ENV"
+          }
+          VAULT_SERVER=$(strip "$VAULT_SERVER"); VAULT_SERVER=${VAULT_SERVER%/}
+          VAULT_ROLE=$(strip "$VAULT_ROLE"); VAULT_AUTH_PATH=$(strip "$VAULT_AUTH_PATH"); VAULT_MOUNT_CI=$(strip "$VAULT_MOUNT_CI")
+          data="{}"
+          if [[ -n "$VAULT_SERVER" && -n "$VAULT_ROLE" && -n "$VAULT_AUTH_PATH" && -n "$VAULT_MOUNT_CI" && -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+            if jwt=$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -er .value) \
+              && token=$(curl -fsSL --data "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${jwt}\"}" "${VAULT_SERVER}/v1/auth/${VAULT_AUTH_PATH}/login" | jq -er .auth.client_token); then
+              echo "::add-mask::$token"
+              data=$(curl -fsSL -H "X-Vault-Token: $token" "${VAULT_SERVER}/v1/${VAULT_MOUNT_CI}/data/ci/shared" | jq -c '.data.data') || data="{}"
+            else
+              echo "::warning::Vault login failed - CI credentials come from secrets"
+            fi
+          fi
+          for name in $WANT; do
+            value=$(jq -r --arg n "$name" '.[$n] // empty' <<< "$data")
+            if [[ -n "$value" ]]; then export_env "$name" "$value"; echo "▸ $name from Vault ${VAULT_MOUNT_CI}/ci/shared"; continue; fi
+            fallback_var="FALLBACK_$name"
+            if [[ -n "${!fallback_var:-}" ]]; then export_env "$name" "${!fallback_var}"; echo "▸ $name from the secret"; fi
+          done
+
       - name: Discover ArgoCD applications
         id: apps
         if: ${{ steps.plan.outputs.count != '0' }}
         env:
           ARGOCD_SERVER: ${{ inputs.argocd_server }}
-          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
           APP_OVERRIDE: ${{ inputs.argocd_app }}
           CHARTS_REPO: ${{ inputs.charts_repo }}
           APP_NAME: ${{ inputs.app }}
@@ -337,12 +374,12 @@ jobs:
         run: |
           set -euo pipefail
           strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
-          ARGOCD_SERVER=$(strip "$ARGOCD_SERVER"); ARGOCD_AUTH_TOKEN=$(strip "$ARGOCD_AUTH_TOKEN"); APP_OVERRIDE=$(strip "$APP_OVERRIDE")
+          ARGOCD_SERVER=$(strip "$ARGOCD_SERVER"); ARGOCD_AUTH_TOKEN=$(strip "${ARGOCD_AUTH_TOKEN:-}"); APP_OVERRIDE=$(strip "$APP_OVERRIDE")
           emit() { { echo "deploy_enabled=$1"; echo "apps<<__EOF__"; [[ -n "${3:-}" ]] && printf '%s\n' "$3"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"; }
 
           if [[ -z "$CHARTS_REPO" ]]; then echo "▸ charts_repo not set — build only, no bump and no sync"; emit true 0 ""; exit 0; fi
           if [[ -z "$ARGOCD_SERVER" ]]; then echo "▸ argocd_server not set — no gate, no sync"; emit true 0 ""; exit 0; fi
-          [[ -n "$ARGOCD_AUTH_TOKEN" ]] || { echo "::error::argocd_server is set but secret ARGOCD_AUTH_TOKEN is empty"; exit 1; }
+          [[ -n "${ARGOCD_AUTH_TOKEN:-}" ]] || { echo "::error::argocd_server is set but ARGOCD_AUTH_TOKEN is in neither Vault <vault_mount_ci>/ci/shared nor the secret"; exit 1; }
           if [[ -n "$APP_OVERRIDE" ]]; then echo "▸ explicit argocd_app='${APP_OVERRIDE}'"; emit true 1 "$APP_OVERRIDE"; exit 0; fi
 
           selector="app=$(strip "$APP_NAME"),env=$(strip "$ENV"),team=$(strip "$TEAM")"
@@ -578,22 +615,59 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
+      id-token: write
     outputs:
       values_file: ${{ steps.bump.outputs.values_file }}
       values_url: ${{ steps.bump.outputs.values_url }}
       bumped: ${{ steps.bump.outputs.bumped }}
     steps:
-      - name: Check charts repo token
+      - name: Read CI credentials from Vault
+        env:
+          VAULT_SERVER: ${{ inputs.vault_server }}
+          VAULT_ROLE: ${{ inputs.vault_role }}
+          VAULT_AUTH_PATH: ${{ inputs.vault_auth_path }}
+          VAULT_MOUNT_CI: ${{ inputs.vault_mount_ci }}
+          AUDIENCE: ${{ github.server_url }}/${{ github.repository_owner }}
+          WANT: CHARTS_REPO_SSH_KEY
+        run: |
+          set -euo pipefail
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          export_env() { # <name> <value>: masked, multi-line safe
+            while IFS= read -r line; do [[ -n "$line" ]] && echo "::add-mask::$line"; done <<< "$2"
+            local delim; delim="EOF_$(openssl rand -hex 8)"
+            { echo "$1<<$delim"; printf '%s\n' "$2"; echo "$delim"; } >> "$GITHUB_ENV"
+          }
+          VAULT_SERVER=$(strip "$VAULT_SERVER"); VAULT_SERVER=${VAULT_SERVER%/}
+          VAULT_ROLE=$(strip "$VAULT_ROLE"); VAULT_AUTH_PATH=$(strip "$VAULT_AUTH_PATH"); VAULT_MOUNT_CI=$(strip "$VAULT_MOUNT_CI")
+          data="{}"
+          if [[ -n "$VAULT_SERVER" && -n "$VAULT_ROLE" && -n "$VAULT_AUTH_PATH" && -n "$VAULT_MOUNT_CI" && -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+            if jwt=$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -er .value) \
+              && token=$(curl -fsSL --data "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${jwt}\"}" "${VAULT_SERVER}/v1/auth/${VAULT_AUTH_PATH}/login" | jq -er .auth.client_token); then
+              echo "::add-mask::$token"
+              data=$(curl -fsSL -H "X-Vault-Token: $token" "${VAULT_SERVER}/v1/${VAULT_MOUNT_CI}/data/ci/shared" | jq -c '.data.data') || data="{}"
+            else
+              echo "::warning::Vault login failed - CI credentials come from secrets"
+            fi
+          fi
+          for name in $WANT; do
+            value=$(jq -r --arg n "$name" '.[$n] // empty' <<< "$data")
+            if [[ -n "$value" ]]; then export_env "$name" "$value"; echo "▸ $name from Vault ${VAULT_MOUNT_CI}/ci/shared"; continue; fi
+            fallback_var="FALLBACK_$name"
+            if [[ -n "${!fallback_var:-}" ]]; then export_env "$name" "${!fallback_var}"; echo "▸ $name from the secret"; fi
+          done
+
+      - name: Check charts repo credentials
         env:
           TOKEN: ${{ secrets.CHARTS_REPO_TOKEN }}
         run: |
-          [[ -n "$TOKEN" ]] || { echo "::error::charts_repo is set but secret CHARTS_REPO_TOKEN is empty"; exit 1; }
+          [[ -n "${CHARTS_REPO_SSH_KEY:-}" || -n "$TOKEN" ]] || { echo "::error::charts_repo is set but CHARTS_REPO_SSH_KEY is not in Vault <vault_mount_ci>/ci/shared and secret CHARTS_REPO_TOKEN is empty"; exit 1; }
 
       - name: Checkout workloads repo
         uses: actions/checkout@v7
         with:
           repository: ${{ inputs.charts_repo }}
-          token: ${{ secrets.CHARTS_REPO_TOKEN }}
+          ssh-key: ${{ env.CHARTS_REPO_SSH_KEY }}
+          token: ${{ env.CHARTS_REPO_SSH_KEY == '' && secrets.CHARTS_REPO_TOKEN || github.token }}
           path: workloads
 
       - name: Download build meta of every component
@@ -692,14 +766,50 @@ jobs:
     if: ${{ inputs.argocd_server != '' && needs.bump.result == 'success' && needs.plan.outputs.apps != '' }}
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 15
-    permissions: {}
+    permissions:
+      id-token: write
     outputs:
       results: ${{ steps.wait.outputs.results }}
     env:
       ARGOCD_SERVER: ${{ inputs.argocd_server }}
-      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
       ARGOCD_OPTS: --grpc-web
     steps:
+      - name: Read CI credentials from Vault
+        env:
+          VAULT_SERVER: ${{ inputs.vault_server }}
+          VAULT_ROLE: ${{ inputs.vault_role }}
+          VAULT_AUTH_PATH: ${{ inputs.vault_auth_path }}
+          VAULT_MOUNT_CI: ${{ inputs.vault_mount_ci }}
+          AUDIENCE: ${{ github.server_url }}/${{ github.repository_owner }}
+          WANT: ARGOCD_AUTH_TOKEN
+          FALLBACK_ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          export_env() { # <name> <value>: masked, multi-line safe
+            while IFS= read -r line; do [[ -n "$line" ]] && echo "::add-mask::$line"; done <<< "$2"
+            local delim; delim="EOF_$(openssl rand -hex 8)"
+            { echo "$1<<$delim"; printf '%s\n' "$2"; echo "$delim"; } >> "$GITHUB_ENV"
+          }
+          VAULT_SERVER=$(strip "$VAULT_SERVER"); VAULT_SERVER=${VAULT_SERVER%/}
+          VAULT_ROLE=$(strip "$VAULT_ROLE"); VAULT_AUTH_PATH=$(strip "$VAULT_AUTH_PATH"); VAULT_MOUNT_CI=$(strip "$VAULT_MOUNT_CI")
+          data="{}"
+          if [[ -n "$VAULT_SERVER" && -n "$VAULT_ROLE" && -n "$VAULT_AUTH_PATH" && -n "$VAULT_MOUNT_CI" && -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+            if jwt=$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -er .value) \
+              && token=$(curl -fsSL --data "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${jwt}\"}" "${VAULT_SERVER}/v1/auth/${VAULT_AUTH_PATH}/login" | jq -er .auth.client_token); then
+              echo "::add-mask::$token"
+              data=$(curl -fsSL -H "X-Vault-Token: $token" "${VAULT_SERVER}/v1/${VAULT_MOUNT_CI}/data/ci/shared" | jq -c '.data.data') || data="{}"
+            else
+              echo "::warning::Vault login failed - CI credentials come from secrets"
+            fi
+          fi
+          for name in $WANT; do
+            value=$(jq -r --arg n "$name" '.[$n] // empty' <<< "$data")
+            if [[ -n "$value" ]]; then export_env "$name" "$value"; echo "▸ $name from Vault ${VAULT_MOUNT_CI}/ci/shared"; continue; fi
+            fallback_var="FALLBACK_$name"
+            if [[ -n "${!fallback_var:-}" ]]; then export_env "$name" "${!fallback_var}"; echo "▸ $name from the secret"; fi
+          done
+
       - name: Install argocd CLI
         run: |
           set -euo pipefail

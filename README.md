@@ -112,10 +112,13 @@ overrides both.
 | `VAULT_MOUNT_CI` | Vault | `example-org-ci` |
 | `VAULT_MOUNT_RUNTIME` | optional, a link in the report | `example-org-runtime` |
 
+With Vault set, the deploy credentials come from `<vault_mount_ci>/ci/shared` (see Vault below); a
+secret below is read only for a field that path does not have.
+
 | secret | needed for | what it is |
 | --- | --- | --- |
-| `CHARTS_REPO_TOKEN` | gitops only, deploy | token with `contents:write` on `charts_repo` |
-| `ARGOCD_AUTH_TOKEN` | deploy | ArgoCD API token that can list and sync the Applications |
+| `CHARTS_REPO_TOKEN` | gitops only, deploy, without `CHARTS_REPO_SSH_KEY` in Vault | token with `contents:write` on `charts_repo` |
+| `ARGOCD_AUTH_TOKEN` | deploy, without `ARGOCD_AUTH_TOKEN` in Vault | ArgoCD API token that can list and sync the Applications |
 | `DOCKER_REGISTRY_PASSWORD` | a registry other than `ghcr.io` | registry password |
 | `TELEGRAM_TOKEN`, `TELEGRAM_CHAT`, `TELEGRAM_THREAD` | optional | failure alerts |
 
@@ -209,6 +212,10 @@ Build-args are read from `<vault_mount_ci>/<team>/<app>[/<component>]/<env>`
   this repository, with read on `<vault_mount_ci>/data/*`.
 
 A missing path means no build-args; any other Vault error fails the build.
+
+The deploy credentials are fields of `<vault_mount_ci>/ci/shared`: `ARGOCD_AUTH_TOKEN` and
+`CHARTS_REPO_SSH_KEY`, the private half of a deploy key with write access on `charts_repo`. A field
+missing there, or a failed login, falls back to the secret of the same purpose.
 
 ### Notes
 
