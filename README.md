@@ -134,7 +134,7 @@ its component `main`.
 | `docker_file` | `Dockerfile` | Dockerfile path inside the context |
 | `docker_registry` | `ghcr.io/<owner>/<repo>-<name>`; without `-<name>` for `main` or a component named after the repo | image without tag |
 | `docker_build_args` | | multiline `KEY=VALUE`; Vault wins on the same key |
-| `paths` | | multiline globs; on a push the component builds only if a changed file matches |
+| `paths` | | multiline globs; on a push the component builds only if a file changed since the previous push to that branch matches |
 | `chart_init_containers` | | initContainers that get the same image |
 | `chart_components_extra` | | other `.components.*` that get the same image |
 

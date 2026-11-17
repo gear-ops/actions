@@ -194,6 +194,7 @@ jobs:
         if: ${{ steps.filters.outputs.yaml != '' }}
         uses: dorny/paths-filter@v4
         with:
+          base: ${{ github.ref }}
           filters: ${{ steps.filters.outputs.yaml }}
 
       - name: Resolve plan
@@ -440,6 +441,7 @@ jobs:
         run: |
           set -euo pipefail
           strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          csv_line() { local s=$1; [[ "$s" == *[\",]* ]] && s="\"${s//\"/\"\"}\""; printf '%s' "$s"; }
           VAULT_SERVER=$(strip "$VAULT_SERVER"); VAULT_SERVER=${VAULT_SERVER%/}; VAULT_ROLE=$(strip "$VAULT_ROLE"); KV_PATH=$(strip "$KV_PATH")
 
           merged="${STATIC_ARGS:-}"
@@ -473,7 +475,7 @@ jobs:
                 while IFS= read -r kv; do
                   [[ -z "$kv" ]] && continue
                   echo "::add-mask::${kv#*=}"
-                  merged+=$'\n'"$kv"; count=$((count+1))
+                  merged+=$'\n'"$(csv_line "$kv")"; count=$((count+1))
                 done < <(printf '%s' "$body" | jq -r '.data.data | to_entries[] | "\(.key)=\(.value)"')
                 echo "▸ ${count} build-arg(s) from ${display_path}" ;;
               404)
