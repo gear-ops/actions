@@ -390,9 +390,9 @@ jobs:
           VAULT_ROLE: ${{ inputs.vault_role }}
           VAULT_AUTH_PATH: ${{ inputs.vault_auth_path }}
           VAULT_MOUNT_CI: ${{ inputs.vault_mount_ci }}
-          AUDIENCE: ${{ github.server_url }}/${{ github.repository_owner }}
           WANT: ARGOCD_AUTH_TOKEN
           FALLBACK_ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          ARGOCD_SERVER: ${{ inputs.argocd_server }}
         run: |
           set -euo pipefail
           strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
@@ -405,13 +405,19 @@ jobs:
           VAULT_ROLE=$(strip "$VAULT_ROLE"); VAULT_AUTH_PATH=$(strip "$VAULT_AUTH_PATH"); VAULT_MOUNT_CI=$(strip "$VAULT_MOUNT_CI")
           data="{}"
           if [[ -n "$VAULT_SERVER" && -n "$VAULT_ROLE" && -n "$VAULT_AUTH_PATH" && -n "$VAULT_MOUNT_CI" && -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
-            if jwt=$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -er .value) \
+            aud=$(jq -rn --arg v "$VAULT_SERVER" '$v | @uri')
+            if jwt=$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${aud}" | jq -er .value) \
               && token=$(curl -fsSL --data "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${jwt}\"}" "${VAULT_SERVER}/v1/auth/${VAULT_AUTH_PATH}/login" | jq -er .auth.client_token); then
               echo "::add-mask::$token"
-              data=$(curl -fsSL -H "X-Vault-Token: $token" "${VAULT_SERVER}/v1/${VAULT_MOUNT_CI}/data/ci/shared" | jq -c '.data.data') || data="{}"
+              data=$(curl -fsSL -H "X-Vault-Token: $token" "${VAULT_SERVER}/v1/${VAULT_MOUNT_CI}/data/ci/shared" | jq -c '.data.data | objects') || data=""
+              [[ -n "$data" ]] || data="{}"
             else
               echo "::warning::Vault login failed - CI credentials come from secrets"
             fi
+          fi
+          server=$(strip "${ARGOCD_SERVER:-}"); pinned=$(jq -r '.ARGOCD_SERVER // empty' <<< "$data")
+          if [[ " $WANT " == *" ARGOCD_AUTH_TOKEN "* && -n "$server" && -n "$pinned" && "$pinned" != "$server" ]]; then
+            echo "::error::the ArgoCD token of Vault ${VAULT_MOUNT_CI}/ci/shared belongs to '${pinned}', but argocd_server is '${server}'"; exit 1
           fi
           for name in $WANT; do
             value=$(jq -r --arg n "$name" '.[$n] // empty' <<< "$data")
@@ -500,7 +506,6 @@ jobs:
           KV_PATH: ${{ matrix.name == 'main'
                       && format('{0}/data/{1}/{2}/{3}', inputs.vault_mount_ci, inputs.team, inputs.app, needs.plan.outputs.env)
                       || format('{0}/data/{1}/{2}/{3}/{4}', inputs.vault_mount_ci, inputs.team, inputs.app, matrix.name, needs.plan.outputs.env) }}
-          AUDIENCE: ${{ github.server_url }}/${{ github.repository_owner }}
         run: |
           set -euo pipefail
           strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
@@ -516,16 +521,18 @@ jobs:
               exit 1
             fi
             display_path="${KV_PATH/\/data\///}"
+            [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]] || { echo "::error::vault_server is set but the job has no OIDC token - the caller workflow needs 'permissions: id-token: write'"; exit 1; }
 
+            aud=$(jq -rn --arg v "$VAULT_SERVER" '$v | @uri')
             jwt=$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r .value)
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${aud}" | jq -r .value)
             login=$(curl -sSL -w '\n%{http_code}' --data "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${jwt}\"}" \
               "${VAULT_SERVER}/v1/auth/${VAULT_AUTH_PATH}/login")
             login_code=$(printf '%s' "$login" | tail -n1)
             token=$(printf '%s' "$login" | sed '$d' | jq -r '.auth.client_token // empty' 2>/dev/null || true)
             if [[ -z "$token" ]]; then
               why=$(printf '%s' "$login" | sed '$d' | jq -r '(.errors // []) | join("; ")' 2>/dev/null || true)
-              echo "::error::Vault login failed with HTTP ${login_code} for role '${VAULT_ROLE}' on auth path '${VAULT_AUTH_PATH}' with audience '${AUDIENCE}': ${why:-no message}. Check that the role's bound_audiences and bound_claims match this repository, including letter case"
+              echo "::error::Vault login failed with HTTP ${login_code} for role '${VAULT_ROLE}' on auth path '${VAULT_AUTH_PATH}' with the audience '${VAULT_SERVER}': ${why:-no message}. Check that the role's bound_audiences and bound_claims match this run, including letter case"
               exit 1
             fi
             echo "::add-mask::$token"
@@ -719,7 +726,6 @@ jobs:
           VAULT_ROLE: ${{ inputs.vault_role }}
           VAULT_AUTH_PATH: ${{ inputs.vault_auth_path }}
           VAULT_MOUNT_CI: ${{ inputs.vault_mount_ci }}
-          AUDIENCE: ${{ github.server_url }}/${{ github.repository_owner }}
           WANT: CHARTS_REPO_SSH_KEY
         run: |
           set -euo pipefail
@@ -733,13 +739,19 @@ jobs:
           VAULT_ROLE=$(strip "$VAULT_ROLE"); VAULT_AUTH_PATH=$(strip "$VAULT_AUTH_PATH"); VAULT_MOUNT_CI=$(strip "$VAULT_MOUNT_CI")
           data="{}"
           if [[ -n "$VAULT_SERVER" && -n "$VAULT_ROLE" && -n "$VAULT_AUTH_PATH" && -n "$VAULT_MOUNT_CI" && -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
-            if jwt=$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -er .value) \
+            aud=$(jq -rn --arg v "$VAULT_SERVER" '$v | @uri')
+            if jwt=$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${aud}" | jq -er .value) \
               && token=$(curl -fsSL --data "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${jwt}\"}" "${VAULT_SERVER}/v1/auth/${VAULT_AUTH_PATH}/login" | jq -er .auth.client_token); then
               echo "::add-mask::$token"
-              data=$(curl -fsSL -H "X-Vault-Token: $token" "${VAULT_SERVER}/v1/${VAULT_MOUNT_CI}/data/ci/shared" | jq -c '.data.data') || data="{}"
+              data=$(curl -fsSL -H "X-Vault-Token: $token" "${VAULT_SERVER}/v1/${VAULT_MOUNT_CI}/data/ci/shared" | jq -c '.data.data | objects') || data=""
+              [[ -n "$data" ]] || data="{}"
             else
               echo "::warning::Vault login failed - CI credentials come from secrets"
             fi
+          fi
+          server=$(strip "${ARGOCD_SERVER:-}"); pinned=$(jq -r '.ARGOCD_SERVER // empty' <<< "$data")
+          if [[ " $WANT " == *" ARGOCD_AUTH_TOKEN "* && -n "$server" && -n "$pinned" && "$pinned" != "$server" ]]; then
+            echo "::error::the ArgoCD token of Vault ${VAULT_MOUNT_CI}/ci/shared belongs to '${pinned}', but argocd_server is '${server}'"; exit 1
           fi
           for name in $WANT; do
             value=$(jq -r --arg n "$name" '.[$n] // empty' <<< "$data")
@@ -906,7 +918,6 @@ jobs:
           VAULT_ROLE: ${{ inputs.vault_role }}
           VAULT_AUTH_PATH: ${{ inputs.vault_auth_path }}
           VAULT_MOUNT_CI: ${{ inputs.vault_mount_ci }}
-          AUDIENCE: ${{ github.server_url }}/${{ github.repository_owner }}
           WANT: ARGOCD_AUTH_TOKEN
           FALLBACK_ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
         run: |
@@ -921,13 +932,19 @@ jobs:
           VAULT_ROLE=$(strip "$VAULT_ROLE"); VAULT_AUTH_PATH=$(strip "$VAULT_AUTH_PATH"); VAULT_MOUNT_CI=$(strip "$VAULT_MOUNT_CI")
           data="{}"
           if [[ -n "$VAULT_SERVER" && -n "$VAULT_ROLE" && -n "$VAULT_AUTH_PATH" && -n "$VAULT_MOUNT_CI" && -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
-            if jwt=$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -er .value) \
+            aud=$(jq -rn --arg v "$VAULT_SERVER" '$v | @uri')
+            if jwt=$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${aud}" | jq -er .value) \
               && token=$(curl -fsSL --data "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${jwt}\"}" "${VAULT_SERVER}/v1/auth/${VAULT_AUTH_PATH}/login" | jq -er .auth.client_token); then
               echo "::add-mask::$token"
-              data=$(curl -fsSL -H "X-Vault-Token: $token" "${VAULT_SERVER}/v1/${VAULT_MOUNT_CI}/data/ci/shared" | jq -c '.data.data') || data="{}"
+              data=$(curl -fsSL -H "X-Vault-Token: $token" "${VAULT_SERVER}/v1/${VAULT_MOUNT_CI}/data/ci/shared" | jq -c '.data.data | objects') || data=""
+              [[ -n "$data" ]] || data="{}"
             else
               echo "::warning::Vault login failed - CI credentials come from secrets"
             fi
+          fi
+          server=$(strip "${ARGOCD_SERVER:-}"); pinned=$(jq -r '.ARGOCD_SERVER // empty' <<< "$data")
+          if [[ " $WANT " == *" ARGOCD_AUTH_TOKEN "* && -n "$server" && -n "$pinned" && "$pinned" != "$server" ]]; then
+            echo "::error::the ArgoCD token of Vault ${VAULT_MOUNT_CI}/ci/shared belongs to '${pinned}', but argocd_server is '${server}'"; exit 1
           fi
           for name in $WANT; do
             value=$(jq -r --arg n "$name" '.[$n] // empty' <<< "$data")

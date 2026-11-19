@@ -215,14 +215,23 @@ Build-args are read from `<vault_mount_ci>/<team>/<app>[/<component>]/<env>`
 
 - a JWT auth method at `auth/<vault_auth_path>` for the issuer
   `https://token.actions.githubusercontent.com`;
-- a role `vault_role` that accepts the audience `https://github.com/<owner>` and
-  this repository, with read on `<vault_mount_ci>/data/*`.
+- a role `vault_role` that accepts the audience `<vault_server>` (the token is asked for
+  Vault itself, so no other server can reuse it) and the calling repository or its owner,
+  with read on `<vault_mount_ci>/data/*`;
+- a KV version 2 engine at `<vault_mount_ci>`, reachable without a Vault namespace.
 
-A missing path means no build-args; any other Vault error fails the build.
+Bind the role to this workflow as well, or any workflow of a calling repository can log in
+with it: `bound_claims` `job_workflow_ref` = `<owner>/<repo>/.github/workflows/build-deploy.yaml@refs/heads/main`
+of the copy you call, and `runner_environment` = `github-hosted`.
+
+A missing path means no build-args; any other Vault error fails the build. A value may span
+several lines.
 
 The deploy credentials are fields of `<vault_mount_ci>/ci/shared`: `ARGOCD_AUTH_TOKEN` and
 `CHARTS_REPO_SSH_KEY`, the private half of a deploy key with write access on `charts_repo`. A field
-missing there, or a failed login, falls back to the secret of the same purpose.
+missing there, or a failed login, falls back to the secret of the same purpose. A field
+`ARGOCD_SERVER` next to the token binds it to that host: a run whose `argocd_server` differs
+stops before the token is sent anywhere.
 
 ### Notes
 
