@@ -160,6 +160,7 @@ give one its own `docker_registry`, or merge them with `chart_components_extra`.
 | `docker_latest_branches` | `main,master` | branches that also push `latest` |
 | `docker_cache` | `false` | buildx cache in the GitHub Actions cache |
 | `docker_image_visibility` | `private` | fail if the `ghcr.io` package is not this; `public` for a public repository, empty to skip |
+| `docker_scan` | `true` | scan each image with Trivy; see Notes |
 | `charts_values_path` | `values/<env>.yaml`, else `values.yaml` | values file inside `charts/<team>/<app>/` |
 | `argocd_app` | by labels | Application name instead of the label lookup |
 | `argocd_timeout` | `600` | seconds to wait for sync and health |
@@ -176,6 +177,7 @@ give one its own `docker_registry`, or merge them with `chart_components_extra`.
    is built if no Application has the labels `app`, `env` and `team`.
 2. `build` builds and pushes each component, with build-args from
    `docker_build_args` and Vault.
+   `scan` then looks each image over with Trivy, beside the deploy and without holding it.
 3. `bump` writes the tag into the GitOps repo and pushes one commit. A component
    whose build failed keeps its tag; the others are still bumped and synced, and
    the run stays failed.
@@ -243,6 +245,10 @@ stops before the token is sent anywhere.
 
 ### Notes
 
+- `scan` runs Trivy from a container pinned by digest, with a token that only reads packages: the
+  summary gets the count of HIGH and CRITICAL findings and how many have a fix, the artifact
+  `scan-<app>-<component>` holds every finding (`report.json`, `report.txt`) for 30 days. It never
+  fails the run; a scan that could not run shows as "no report".
 - `paths` compares with the last push of the branch that was delivered: `plan` passed, every
   build passed and `bump` wrote them to the chart. A push that failed earlier, was cancelled
   or was replaced in the queue is therefore built again with the next one. Without such a push
@@ -277,3 +283,5 @@ stops before the token is sent anywhere.
 | `actions/upload-artifact`, `actions/download-artifact` | component results for bump and report |
 | `snok/container-retention-policy` | GHCR prune by tag, so `latest` stays protected |
 | `appleboy/telegram-action` | failure alert |
+
+Not an action: `docker.io/aquasec/trivy`, the image scanner, pinned by digest in the `scan` job.

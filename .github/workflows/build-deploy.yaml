@@ -55,6 +55,10 @@ on:
         description: "ghcr.io package visibility: private | public. Empty = no check"
         type: string
         default: "private"
+      docker_scan:
+        description: "Scan each image with Trivy: HIGH and CRITICAL counts in the summary, the findings as an artifact. Never fails the run"
+        type: boolean
+        default: true
 
       # ─── vault (build-args, deploy credentials) ──────────────────────────────
       vault_server:
@@ -627,6 +631,53 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
+  scan:
+    name: scan${{ matrix.label }}
+    needs: [plan, build]
+    if: ${{ !cancelled() && inputs.docker_scan && needs.build.result != 'skipped' }}
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 20
+    continue-on-error: true
+    permissions:
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Scan the image with Trivy
+        env:
+          TRIVY_IMAGE: docker.io/aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+          IMAGE: ${{ matrix.docker_image }}
+          REGISTRY: ${{ matrix.docker_registry }}
+          APP: ${{ inputs.app }}
+          COMPONENT: ${{ matrix.name }}
+          REGISTRY_USERNAME: ${{ inputs.docker_registry_username != '' && inputs.docker_registry_username || github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.DOCKER_REGISTRY_PASSWORD }}
+          PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/scan/$(printf '%s' "$APP" | tr -d '[:space:]')/${COMPONENT}"; mkdir -p "$out"
+          export TRIVY_USERNAME="$REGISTRY_USERNAME" TRIVY_PASSWORD="$REGISTRY_PASSWORD"
+          if [[ -z "$TRIVY_PASSWORD" && "$REGISTRY" == ghcr.io/* ]]; then TRIVY_PASSWORD="$PACKAGES_TOKEN"; fi
+          trivy() { docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "${out}:/out" "$TRIVY_IMAGE" "$@"; }
+          trivy image --quiet --scanners vuln --severity HIGH,CRITICAL --timeout 15m --format json --output /out/report.json "$IMAGE"
+          trivy convert --format table --output /out/report.txt /out/report.json
+          jq -r '[.Results[]?.Vulnerabilities[]?] as $v
+            | def n(s): [$v[] | select(.Severity == s)] | length;
+              def f(s): [$v[] | select(.Severity == s and ((.FixedVersion // "") != ""))] | length;
+              "CRITICAL=\(n("CRITICAL"))", "CRITICAL_FIXABLE=\(f("CRITICAL"))", "HIGH=\(n("HIGH"))", "HIGH_FIXABLE=\(f("HIGH"))"' "${out}/report.json" > "${out}/counts.env"
+          echo "▸ ${IMAGE}: $(paste -sd' ' "${out}/counts.env")"
+
+      - name: Upload the scan report
+        uses: actions/upload-artifact@v7
+        with:
+          name: scan-${{ inputs.app }}-${{ matrix.name }}
+          path: ${{ runner.temp }}/scan
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true
+
   cleanup:
     needs: [plan, build, bump, sync]
     if: >-
@@ -1059,7 +1110,7 @@ jobs:
           echo "images_count=$count" >> "$GITHUB_OUTPUT"; put images "$images"
 
   report:
-    needs: [plan, build, cleanup, bump, sync]
+    needs: [plan, build, scan, cleanup, bump, sync]
     if: ${{ always() }}
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 2
@@ -1071,6 +1122,15 @@ jobs:
         with:
           pattern: build-meta-${{ inputs.app }}-*
           path: meta
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Download scan reports
+        if: ${{ inputs.docker_scan }}
+        uses: actions/download-artifact@v8
+        with:
+          pattern: scan-${{ inputs.app }}-*
+          path: scan
           merge-multiple: true
         continue-on-error: true
 
@@ -1096,6 +1156,7 @@ jobs:
           CLEANUP_NOTE: ${{ needs.cleanup.outputs.note }}
           CLEANUP_KEEP: ${{ inputs.cleanup_keep }}
           CLEANUP_ENABLED: ${{ inputs.cleanup_enabled }}
+          SCAN_ENABLED: ${{ inputs.docker_scan }}
           ARGOCD_SERVER: ${{ inputs.argocd_server }}
           VAULT_SERVER: ${{ inputs.vault_server }}
           VAULT_MOUNT_CI: ${{ inputs.vault_mount_ci }}
@@ -1132,11 +1193,22 @@ jobs:
 
           while IFS=$'\t' read -r name image; do
             [[ -z "$name" ]] && continue
-            st="$BUILD_RESULT"; f="meta/$(printf '%s' "$APP" | tr -d '[:space:]')/${name}/build-meta.env"
+            app_dir=$(printf '%s' "$APP" | tr -d '[:space:]')
+            st="$BUILD_RESULT"; f="meta/${app_dir}/${name}/build-meta.env"
             [[ -f "$f" ]] && st=$(sed -n 's/^STATUS=//p' "$f")
             lbl="build"; [[ "$name" != "main" ]] && lbl="build ${name}"
             if [[ "$st" == "success" ]]; then row "🐳 Build \`${name}\`" "✅" "\`${image}\`"
             else row "🐳 Build \`${name}\`" "$(icon "$st")" "$(log_link "$lbl")"; fi
+            if [[ "$SCAN_ENABLED" == "true" && "$st" == "success" ]]; then
+              c="scan/${app_dir}/${name}/counts.env"; slbl="scan"; [[ "$name" != "main" ]] && slbl="scan ${name}"
+              if [[ -f "$c" ]]; then
+                n() { sed -n "s/^$1=\([0-9][0-9]*\)\$/\1/p" "$c"; }
+                mark="✅"; [[ "$(n CRITICAL)" == "0" ]] || mark="⚠️"
+                row "🛡 Scan \`${name}\`" "$mark" "critical $(n CRITICAL) ($(n CRITICAL_FIXABLE) fixable), high $(n HIGH) ($(n HIGH_FIXABLE) fixable) · artifact [\`scan-${APP}-${name}\`](${LOGS}#artifacts)"
+              else
+                row "🛡 Scan \`${name}\`" "⏭" "no report — $(log_link "$slbl")"
+              fi
+            fi
           done < <(jq -r '.[] | [.name, .docker_image] | @tsv' <<< "${MATRIX:-[]}")
           while IFS= read -r sk; do sk="${sk#"${sk%%[! ]*}"}"; [[ -z "$sk" ]] && continue; row "🐳 Build \`${sk%%:*}\`" "⏭" "${sk#*: }"; done <<< "${SKIPPED//; /$'\n'}"
 
