@@ -56,7 +56,7 @@ on:
         type: string
         default: "private"
 
-      # ─── vault (build-args) ──────────────────────────────────────────────────
+      # ─── vault (build-args, deploy credentials) ──────────────────────────────
       vault_server:
         description: "Vault URL; build-args read from <vault_mount_ci>/<team>/<app>[/<component>]/<env> via OIDC. Empty = off"
         type: string
@@ -142,7 +142,7 @@ on:
         description: "Non-ghcr registry password"
       CHARTS_REPO_TOKEN:
         required: false
-        description: "PAT, contents:write on charts_repo. Required unless charts_repo is empty"
+        description: "PAT, contents:write on charts_repo. Needed with charts_repo unless CHARTS_REPO_SSH_KEY comes from Vault"
       ARGOCD_AUTH_TOKEN:
         required: false
         description: "ArgoCD API token"
@@ -440,9 +440,12 @@ jobs:
           set -euo pipefail
           strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
           ARGOCD_SERVER=$(strip "$ARGOCD_SERVER"); ARGOCD_AUTH_TOKEN=$(strip "${ARGOCD_AUTH_TOKEN:-}"); APP_OVERRIDE=$(strip "$APP_OVERRIDE")
-          emit() { { echo "deploy_enabled=$1"; echo "apps<<__EOF__"; [[ -n "${3:-}" ]] && printf '%s\n' "$3"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"; }
+          emit() { local d; d="EOF_$(openssl rand -hex 16)"; { echo "deploy_enabled=$1"; echo "apps<<$d"; [[ -z "${3:-}" ]] || printf '%s\n' "$3"; echo "$d"; } >> "$GITHUB_OUTPUT"; }
 
-          if [[ -z "$CHARTS_REPO" ]]; then echo "▸ charts_repo not set — build only, no bump and no sync"; emit true 0 ""; exit 0; fi
+          if [[ -z "$CHARTS_REPO" ]]; then
+            [[ -z "$ARGOCD_SERVER" ]] || echo "::warning::argocd_server is set but charts_repo is not — images are built, nothing is deployed"
+            echo "▸ charts_repo not set — build only, no bump and no sync"; emit true 0 ""; exit 0
+          fi
           if [[ -z "$ARGOCD_SERVER" ]]; then echo "▸ argocd_server not set — no gate, no sync"; emit true 0 ""; exit 0; fi
           [[ -n "${ARGOCD_AUTH_TOKEN:-}" ]] || { echo "::error::argocd_server is set but ARGOCD_AUTH_TOKEN is in neither Vault <vault_mount_ci>/ci/shared nor the secret"; exit 1; }
           if [[ -n "$APP_OVERRIDE" ]]; then
@@ -461,7 +464,7 @@ jobs:
           [[ -z "$odd" ]] || { echo "::error::ArgoCD returned a name that is not an Application name"; exit 1; }
           count=$(printf '%s\n' "$apps" | awk 'NF' | wc -l | tr -d ' ')
           if [[ -z "$apps" ]]; then
-            echo "::notice::No ArgoCD Application matches '${selector}' — env '${ENV}' is not deployed; nothing to build"
+            echo "::notice::No ArgoCD Application carries the labels '${selector}' — env '${ENV}' is not deployed, nothing to build. Label the Application, or name it in argocd_app"
             emit false 0 ""
           else
             emit true "$count" "$apps"
@@ -601,7 +604,7 @@ jobs:
             echo "visibility=${got}"
             exit 0
           fi
-          echo "::error::${REGISTRY} is ${got}, expected ${WANT}. Fix it at ${GITHUB_SERVER_URL}/${kind}/${owner}/packages/container/${enc}/settings"
+          echo "::error::${REGISTRY} is ${got}, the input docker_image_visibility expects ${WANT}. Change the input, or the package at ${GITHUB_SERVER_URL}/${kind}/${owner}/packages/container/${enc}/settings"
           exit 1
 
       - name: Persist build meta
@@ -777,13 +780,13 @@ jobs:
         run: |
           [[ -n "${CHARTS_REPO_SSH_KEY:-}" || -n "$TOKEN" ]] || { echo "::error::charts_repo is set but CHARTS_REPO_SSH_KEY is not in Vault <vault_mount_ci>/ci/shared and secret CHARTS_REPO_TOKEN is empty"; exit 1; }
 
-      - name: Checkout workloads repo
+      - name: Checkout the GitOps repo
         uses: actions/checkout@v7
         with:
           repository: ${{ inputs.charts_repo }}
           ssh-key: ${{ env.CHARTS_REPO_SSH_KEY }}
           token: ${{ env.CHARTS_REPO_SSH_KEY == '' && secrets.CHARTS_REPO_TOKEN || github.token }}
-          path: workloads
+          path: gitops
 
       - name: Download build meta of every component
         uses: actions/download-artifact@v8
@@ -794,7 +797,7 @@ jobs:
 
       - name: Bump image tags
         id: bump
-        working-directory: workloads
+        working-directory: gitops
         env:
           TEAM: ${{ inputs.team }}
           APP: ${{ inputs.app }}
@@ -881,16 +884,17 @@ jobs:
           [[ "$refs_ok" == "true" ]] && refs_count=$(awk 'NF' <<< "$refs" | wc -l | tr -d ' ')
 
           echo "▸ values diff:"; git --no-pager diff "$values" || true
+          delim="EOF_$(openssl rand -hex 16)"
           {
             echo "values_file=$values"
             echo "values_url=${GITHUB_SERVER_URL}/${CHARTS_REPO}/blob/HEAD/${values}"
             echo "bumped=$bumped"
             echo "image_refs_count=$refs_count"
-            echo "image_refs<<__EOF__"; printf '%s\n' "$refs"; echo "__EOF__"
+            echo "image_refs<<${delim}"; printf '%s\n' "$refs"; echo "$delim"
           } >> "$GITHUB_OUTPUT"
 
       - name: Commit and push
-        working-directory: workloads
+        working-directory: gitops
         env:
           MESSAGE: "ci(${{ inputs.team }}/${{ inputs.app }}): ${{ needs.plan.outputs.env }} → ${{ needs.plan.outputs.tag }} [${{ steps.bump.outputs.bumped }}]"
         run: |
@@ -1090,6 +1094,7 @@ jobs:
           SYNC_RESULTS: ${{ needs.sync.outputs.results }}
           CLEANUP_RESULT: ${{ needs.cleanup.result }}
           CLEANUP_NOTE: ${{ needs.cleanup.outputs.note }}
+          CLEANUP_KEEP: ${{ inputs.cleanup_keep }}
           CLEANUP_ENABLED: ${{ inputs.cleanup_enabled }}
           ARGOCD_SERVER: ${{ inputs.argocd_server }}
           VAULT_SERVER: ${{ inputs.vault_server }}
@@ -1147,7 +1152,7 @@ jobs:
             while IFS='|' read -r a outcome; do
               [[ -z "$a" ]] && continue
               mark=""; [[ "$outcome" == "fail" ]] && mark="❌ "
-              sync+="${sync:+, }${mark}[\`${a}\`](https://${ARGOCD_SERVER}/applications/argocd/${a}?operation=true)"
+              sync+="${sync:+, }${mark}[\`${a}\`](https://${ARGOCD_SERVER}/applications/${a}?operation=true)"
             done <<< "${SYNC_RESULTS:-}"
             [[ "$SYNC_RESULT" == "failure" && -z "$sync" ]] && sync="$(log_link sync)"
             row "🚀 Sync" "$(icon "$SYNC_RESULT")" "${sync:-—}"
@@ -1155,7 +1160,7 @@ jobs:
 
           if [[ "$CLEANUP_ENABLED" == "true" ]]; then
             case "$CLEANUP_RESULT" in
-              success) cl="${CLEANUP_NOTE:-keep ${{ inputs.cleanup_keep }}}" ;;
+              success) cl="${CLEANUP_NOTE:-keep ${CLEANUP_KEEP}}" ;;
               failure) cl="$(log_link cleanup)" ;;
               *)       cl="—" ;;
             esac
@@ -1174,6 +1179,16 @@ jobs:
       TG_CHAT: ${{ secrets.TELEGRAM_CHAT }}
       TG_THREAD: ${{ secrets.TELEGRAM_THREAD }}
     steps:
+      - name: Escape names for Markdown
+        id: text
+        if: env.TG_TOKEN != ''
+        env:
+          APP: ${{ inputs.team != '' && format('{0}/{1}', inputs.team, inputs.app) || inputs.app }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          clean() { printf '%s' "$1" | tr '`\n' "' "; }
+          { echo "app=$(clean "$APP")"; echo "branch=$(clean "$BRANCH")"; } >> "$GITHUB_OUTPUT"
+
       - name: Send Telegram notification
         if: env.TG_TOKEN != ''
         uses: appleboy/telegram-action@v1.1.1
@@ -1186,10 +1201,10 @@ jobs:
           message: |
             🔥 *CI/CD failed*
 
-            - app: `${{ inputs.team != '' && format('{0}/{1}', inputs.team, inputs.app) || inputs.app }}`
+            - app: `${{ steps.text.outputs.app }}`
             - env: `${{ needs.plan.outputs.env }}`
             - repo: `${{ github.repository }}`
-            - branch: `${{ github.ref_name }}`
+            - branch: `${{ steps.text.outputs.branch }}`
             - actor: `${{ github.actor }}`
 
             [logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})

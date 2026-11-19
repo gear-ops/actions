@@ -156,7 +156,7 @@ give one its own `docker_registry`, or merge them with `chart_components_extra`.
 | `docker_registry_username` | `github.actor` | registry login |
 | `docker_tag` | `<UTC timestamp>_<branch>_<short sha>` | image tag |
 | `docker_tags_extra` | | multiline extra tags, kept by cleanup |
-| `docker_prefix_tag` | `false` | monorepo: prefix tags with `<app>-` |
+| `docker_prefix_tag` | `false` | monorepo: prefix tags with `<app>-`, unless the repository name already holds the app name |
 | `docker_latest_branches` | `main,master` | branches that also push `latest` |
 | `docker_cache` | `false` | buildx cache in the GitHub Actions cache |
 | `docker_image_visibility` | `private` | fail if the `ghcr.io` package is not this; `public` for a public repository, empty to skip |
@@ -165,13 +165,14 @@ give one its own `docker_registry`, or merge them with `chart_components_extra`.
 | `argocd_timeout` | `600` | seconds to wait for sync and health |
 | `cleanup_enabled` | `true` | prune old `ghcr.io` versions, never one the chart names or a pod runs; in build only mode see Notes |
 | `cleanup_keep` | `3` | versions to keep per image |
-| `runs_on` | `ubuntu-latest` | runner label |
+| `runs_on` | `ubuntu-latest` | runner label; for a runner of your own see Notes |
 
 ### What a run does
 
 1. `plan` picks the environment from the branch (tags are ignored), the tag and
-   the components to build: a manual run skips unchecked `deploy_<component>`,
-   a push skips components whose `paths` did not change. In deploy mode nothing
+   the components to build: a manual run skips unchecked `deploy_<component>`
+   (`deploy` for the component `main`), a push skips components whose `paths`
+   did not change. In deploy mode nothing
    is built if no Application has the labels `app`, `env` and `team`.
 2. `build` builds and pushes each component, with build-args from
    `docker_build_args` and Vault.
