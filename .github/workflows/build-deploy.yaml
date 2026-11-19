@@ -504,10 +504,10 @@ jobs:
         run: |
           set -euo pipefail
           strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
-          csv_line() { local s=$1; [[ "$s" == *[\",]* ]] && s="\"${s//\"/\"\"}\""; printf '%s' "$s"; }
+          csv_line() { local s=$1 nl=$'\n'; [[ "$s" == *[\",]* || "$s" == *"$nl"* || "$s" == *$'\r'* ]] && s="\"${s//\"/\"\"}\""; printf '%s' "$s"; }
           VAULT_SERVER=$(strip "$VAULT_SERVER"); VAULT_SERVER=${VAULT_SERVER%/}; VAULT_ROLE=$(strip "$VAULT_ROLE"); KV_PATH=$(strip "$KV_PATH")
 
-          merged="${STATIC_ARGS:-}"
+          merged=$(awk 'NF' <<< "${STATIC_ARGS:-}")
 
           if [[ -n "$VAULT_SERVER" ]]; then
             VAULT_AUTH_PATH=$(strip "$VAULT_AUTH_PATH"); VAULT_MOUNT_CI=$(strip "$VAULT_MOUNT_CI")
@@ -534,12 +534,15 @@ jobs:
             code=$(printf '%s' "$resp" | tail -n1); body=$(printf '%s' "$resp" | sed '$d')
             case "$code" in
               200)
+                entries=$(jq -r '.data.data | if type == "object" then to_entries[] | "\(.key)=\(.value)" | @base64 else error("no data") end' <<< "$body" 2>/dev/null) \
+                  || { echo "::error::Vault answered ${display_path} with something that is not a secret"; exit 1; }
                 count=0
-                while IFS= read -r kv; do
-                  [[ -z "$kv" ]] && continue
-                  echo "::add-mask::${kv#*=}"
-                  merged+=$'\n'"$(csv_line "$kv")"; count=$((count+1))
-                done < <(printf '%s' "$body" | jq -r '.data.data | to_entries[] | "\(.key)=\(.value)"')
+                while IFS= read -r b64; do
+                  [[ -n "$b64" ]] || continue
+                  kv=$(base64 -d <<< "$b64")
+                  while IFS= read -r line; do [[ -z "$line" ]] || echo "::add-mask::$line"; done <<< "${kv#*=}"
+                  merged+="${merged:+$'\n'}$(csv_line "$kv")"; count=$((count+1))
+                done <<< "$entries"
                 echo "▸ ${count} build-arg(s) from ${display_path}" ;;
               404)
                 echo "▸ no build-args in Vault at ${display_path} — static args only" ;;
@@ -548,7 +551,8 @@ jobs:
             esac
           fi
 
-          { echo "merged<<__EOF__"; printf '%s\n' "$merged" | awk 'NF'; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
+          delim="EOF_$(openssl rand -hex 8)"
+          { echo "merged<<${delim}"; printf '%s\n' "$merged"; echo "$delim"; } >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
         uses: docker/build-push-action@v7
