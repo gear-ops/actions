@@ -159,7 +159,7 @@ give one its own `docker_registry`, or merge them with `chart_components_extra`.
 | `charts_values_path` | `values/<env>.yaml`, else `values.yaml` | values file inside `charts/<team>/<app>/` |
 | `argocd_app` | by labels | Application name instead of the label lookup |
 | `argocd_timeout` | `600` | seconds to wait for sync and health |
-| `cleanup_enabled` | `true` | prune old `ghcr.io` versions |
+| `cleanup_enabled` | `true` | prune old `ghcr.io` versions, never one the chart names |
 | `cleanup_keep` | `3` | versions to keep per image |
 | `runs_on` | `ubuntu-latest` | runner label |
 
@@ -173,7 +173,8 @@ give one its own `docker_registry`, or merge them with `chart_components_extra`.
    `docker_build_args` and Vault.
 3. `bump` writes the tag into the GitOps repo and pushes one commit.
 4. `sync` syncs the Applications and waits until they are healthy.
-5. `cleanup` keeps the last `cleanup_keep` versions of each `ghcr.io` image.
+5. `cleanup` keeps the last `cleanup_keep` versions of each `ghcr.io` image and
+   every tag the chart names.
 6. `report` writes the run summary; `notify` sends a Telegram alert when `plan`,
    `build`, `bump` or `sync` fails.
 
@@ -224,6 +225,14 @@ missing there, or a failed login, falls back to the secret of the same purpose.
   the package settings page; the check only reports it.
 - Cleanup prunes only images built in the run, all under one `ghcr.io` account,
   and keeps `latest` and `docker_tags_extra`.
+- Cleanup never deletes an image the chart names: `bump` collects every `tag` from the YAML
+  files of `charts/<team>/<app>/` (every env, templates aside) and `cleanup` excludes them; a
+  `tag` without a `repository` next to it is kept for every image. If one of the files cannot
+  be parsed, or the scan misses the tag `bump` has just written, nothing is pruned and the
+  summary says so.
+- `bump` warns when the bumped values file still names another tag of an image built in the
+  run: that container is listed in neither `chart_init_containers` nor `chart_components_extra`,
+  so its tag never moves.
 
 ## Actions used
 

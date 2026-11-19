@@ -122,7 +122,7 @@ on:
 
       # ─── cleanup ─────────────────────────────────────────────────────────────
       cleanup_enabled:
-        description: "Prune old GHCR versions (keeps latest + docker_tags_extra)"
+        description: "Prune old GHCR versions (keeps latest, docker_tags_extra and every tag the chart names)"
         type: boolean
         default: true
       cleanup_keep:
@@ -563,6 +563,8 @@ jobs:
     timeout-minutes: 5
     permissions:
       packages: write
+    outputs:
+      note: ${{ steps.pkg.outputs.note }}
     steps:
       - name: Resolve cleanup parameters
         id: pkg
@@ -573,10 +575,20 @@ jobs:
           APP: ${{ inputs.app }}
           REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
+          BUMP_RESULT: ${{ needs.bump.result }}
+          IMAGE_REFS: ${{ needs.bump.outputs.image_refs }}
+          IMAGE_REFS_COUNT: ${{ needs.bump.outputs.image_refs_count }}
         run: |
           set -euo pipefail
           mapfile -t regs < <(jq -r '.[].docker_registry | select(startswith("ghcr.io/"))' <<< "$MATRIX" | sort -u)
           if [[ ${#regs[@]} -eq 0 ]]; then echo "▸ no ghcr.io image in this run — nothing to prune"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [[ "$BUMP_RESULT" == "success" ]]; then
+            got=$(awk 'NF' <<< "${IMAGE_REFS:-}" | wc -l | tr -d ' ')
+            if [[ -z "$IMAGE_REFS_COUNT" || "$got" != "$IMAGE_REFS_COUNT" ]]; then
+              echo "::warning::the image references of the chart did not arrive complete (${got} of ${IMAGE_REFS_COUNT:-unknown}) — nothing is pruned"
+              { echo "skip=true"; echo "note=nothing pruned: the image references of the chart are incomplete"; } >> "$GITHUB_OUTPUT"; exit 0
+            fi
+          fi
           mapfile -t accounts < <(printf '%s\n' "${regs[@]}" | sed 's|^ghcr.io/||; s|/.*||' | sort -u)
           if [[ ${#accounts[@]} -ne 1 ]]; then
             echo "::error::components span several registry accounts (${accounts[*]}); cleanup supports one"
@@ -596,6 +608,12 @@ jobs:
             protection="!latest"
             while IFS= read -r t; do t="${t//[[:space:]]/}"; [[ -n "$t" ]] && protection+=" !${t}"; done <<< "${TAGS_EXTRA:-}"
           fi
+          while IFS='|' read -r r t; do
+            [[ "$t" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] || continue
+            for reg in "${regs[@]}"; do
+              if [[ -z "$r" || "${r,,}" == "${reg,,}" ]]; then protection+=" !${t}"; echo "▸ kept, the chart names it: ${r:-<any image>}:${t}"; break; fi
+            done
+          done <<< "${IMAGE_REFS:-}"
           echo "protection=${protection}" >> "$GITHUB_OUTPUT"
 
       - name: Prune image versions
@@ -622,6 +640,8 @@ jobs:
       values_file: ${{ steps.bump.outputs.values_file }}
       values_url: ${{ steps.bump.outputs.values_url }}
       bumped: ${{ steps.bump.outputs.bumped }}
+      image_refs: ${{ steps.bump.outputs.image_refs }}
+      image_refs_count: ${{ steps.bump.outputs.image_refs_count }}
     steps:
       - name: Read CI credentials from Vault
         env:
@@ -712,13 +732,13 @@ jobs:
           mapfile -t metas < <(find ../meta -name build-meta.env -type f | sort)
           [[ ${#metas[@]} -gt 0 ]] || { echo "::error::no build-meta artifacts found"; exit 1; }
 
-          bumped=""
+          bumped=""; declare -A built=()
           for f in "${metas[@]}"; do
             unset STATUS COMPONENT IMAGE INIT_CONTAINERS COMPONENTS_EXTRA
             # shellcheck disable=SC1090
             source "$f"
             [[ "${STATUS:-}" == "success" ]] || continue
-            repo="${IMAGE%:*}"; tag="${IMAGE##*:}"
+            repo="${IMAGE%:*}"; tag="${IMAGE##*:}"; built["$repo"]="$tag"
             require_component "$COMPONENT"
             set_image "$COMPONENT" "containers.main" "$repo" "$tag"
             bumped+="${bumped:+,}${COMPONENT}"
@@ -740,11 +760,33 @@ jobs:
           [[ -n "$bumped" ]] || { echo "::error::every component build-meta reports failure — nothing to bump"; exit 1; }
           bumped=$(tr ',' '\n' <<< "$bumped" | awk 'NF && !seen[$0]++' | paste -sd, -)
 
+          image_refs() { # <file>: "<path>|<repository>|<tag>" for every image the file names; repository is empty where only the tag is overridden
+            yq -N -r 'explode(.) | .. | select(tag == "!!map") | select(has("tag")) | select(.tag | tag != "!!map" and tag != "!!seq" and tag != "!!null") | [(path | join(".")), (.repository // ""), .tag] | join("|")' "$1"
+          }
+          while IFS='|' read -r where r t; do
+            [[ -n "$r" && -n "$t" && -n "${built[$r]:-}" && "$t" != "${built[$r]}" && "$t" != *latest ]] || continue
+            echo "::warning::${values}: ${where:-.} stays on ${r}:${t} while this run deploys ${built[$r]} — add it to chart_init_containers or chart_components_extra, or drop it from the chart"
+          done < <(image_refs "$values")
+
+          refs=""; refs_count=""; refs_ok=true
+          while IFS= read -r f; do
+            if out=$(image_refs "$f"); then refs+="${out}"$'\n'
+            else refs_ok=false; echo "::warning::the image references of ${f} could not be read — cleanup will not prune"; fi
+          done < <(find "$chart_dir" -mindepth 1 -type d -name templates -prune -o -type f \( -name '*.yaml' -o -name '*.yml' \) -print | sort)
+          refs=$(awk -F'|' 'NF == 3 && $3 != "" { print $2 "|" $3 }' <<< "$refs" | sort -u)
+          for repo in "${!built[@]}"; do
+            grep -qxF "${repo}|${built[$repo]}" <<< "$refs" && continue
+            refs_ok=false; echo "::warning::${repo}:${built[$repo]} was just written to ${values}, but the scan of ${chart_dir} did not find it — cleanup will not prune"
+          done
+          [[ "$refs_ok" == "true" ]] && refs_count=$(awk 'NF' <<< "$refs" | wc -l | tr -d ' ')
+
           echo "▸ values diff:"; git --no-pager diff "$values" || true
           {
             echo "values_file=$values"
             echo "values_url=${GITHUB_SERVER_URL}/${CHARTS_REPO}/blob/HEAD/${values}"
             echo "bumped=$bumped"
+            echo "image_refs_count=$refs_count"
+            echo "image_refs<<__EOF__"; printf '%s\n' "$refs"; echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
       - name: Commit and push
@@ -880,6 +922,7 @@ jobs:
           SYNC_RESULT: ${{ needs.sync.result }}
           SYNC_RESULTS: ${{ needs.sync.outputs.results }}
           CLEANUP_RESULT: ${{ needs.cleanup.result }}
+          CLEANUP_NOTE: ${{ needs.cleanup.outputs.note }}
           CLEANUP_ENABLED: ${{ inputs.cleanup_enabled }}
           ARGOCD_SERVER: ${{ inputs.argocd_server }}
           VAULT_SERVER: ${{ inputs.vault_server }}
@@ -945,7 +988,7 @@ jobs:
 
           if [[ "$CLEANUP_ENABLED" == "true" ]]; then
             case "$CLEANUP_RESULT" in
-              success) cl="keep ${{ inputs.cleanup_keep }}" ;;
+              success) cl="${CLEANUP_NOTE:-keep ${{ inputs.cleanup_keep }}}" ;;
               failure) cl="$(log_link cleanup)" ;;
               *)       cl="—" ;;
             esac
