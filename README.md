@@ -163,7 +163,7 @@ give one its own `docker_registry`, or merge them with `chart_components_extra`.
 | `charts_values_path` | `values/<env>.yaml`, else `values.yaml` | values file inside `charts/<team>/<app>/` |
 | `argocd_app` | by labels | Application name instead of the label lookup |
 | `argocd_timeout` | `600` | seconds to wait for sync and health |
-| `cleanup_enabled` | `true` | prune old `ghcr.io` versions, never one the chart names |
+| `cleanup_enabled` | `true` | prune old `ghcr.io` versions, never one the chart names or a pod runs; in build only mode see Notes |
 | `cleanup_keep` | `3` | versions to keep per image |
 | `runs_on` | `ubuntu-latest` | runner label |
 
@@ -178,9 +178,9 @@ give one its own `docker_registry`, or merge them with `chart_components_extra`.
 3. `bump` writes the tag into the GitOps repo and pushes one commit. A component
    whose build failed keeps its tag; the others are still bumped and synced, and
    the run stays failed.
-4. `sync` syncs the Applications and waits until they are healthy.
-5. `cleanup` keeps the last `cleanup_keep` versions of each `ghcr.io` image and
-   every tag the chart names.
+4. `sync` syncs the Applications and waits until they are synced and healthy.
+5. `cleanup` keeps the last `cleanup_keep` versions of each `ghcr.io` image,
+   every tag the chart names and every image a pod still runs.
 6. `report` writes the run summary; `notify` sends a Telegram alert when `plan`,
    `build`, `bump` or `sync` fails.
 
@@ -250,15 +250,21 @@ stops before the token is sent anywhere.
   repository and no API can change it, so a wrong one is fixed once by hand on
   the package settings page; the check only reports it.
 - Cleanup prunes only images built in the run, all under one `ghcr.io` account,
-  and keeps `latest` and `docker_tags_extra`.
-- Cleanup never deletes an image the chart names: `bump` collects every `tag` from the YAML
-  files of `charts/<team>/<app>/` (every env, templates aside) and `cleanup` excludes them; a
-  `tag` without a `repository` next to it is kept for every image. If one of the files cannot
-  be parsed, or the scan misses the tag `bump` has just written, nothing is pruned and the
-  summary says so.
+  and keeps `latest` and `docker_tags_extra`. In build only mode it knows neither the chart
+  nor the pods, so it keeps just the newest `cleanup_keep` versions: set
+  `cleanup_enabled: false` there if something deploys these images.
+- Cleanup never deletes an image the chart names: `bump` collects every image from the YAML
+  files of `charts/<team>/<app>/` (every env, templates aside), written as a `repository` and
+  `tag` pair or as one `repository:tag` string, and `cleanup` excludes them; a `tag` without a
+  `repository` next to it is kept for every image. If one of the files cannot be parsed, or
+  the scan misses the tag `bump` has just written, nothing is pruned and the summary says so.
+- Cleanup never deletes an image a pod runs either: after the sync, `sync` asks ArgoCD for the
+  images running in every Application labelled `app` and `team` (any env) and `cleanup`
+  excludes them. If ArgoCD does not answer, nothing is pruned.
 - `bump` warns when the bumped values file still names another tag of an image built in the
-  run: that container is listed in neither `chart_init_containers` nor `chart_components_extra`,
-  so its tag never moves.
+  run: the bump does not reach that place, so its tag never moves.
+- A runner of your own needs Linux, bash 4 or newer, Docker with buildx, `git`, `curl`, `jq`,
+  `openssl`, `gh` and mikefarah `yq` v4.
 
 ## Actions used
 

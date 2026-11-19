@@ -122,7 +122,7 @@ on:
 
       # ─── cleanup ─────────────────────────────────────────────────────────────
       cleanup_enabled:
-        description: "Prune old GHCR versions (keeps latest, docker_tags_extra and every tag the chart names)"
+        description: "Prune old GHCR versions (keeps latest, docker_tags_extra, every tag the chart names and every image a pod runs)"
         type: boolean
         default: true
       cleanup_keep:
@@ -651,17 +651,21 @@ jobs:
           BUMP_RESULT: ${{ needs.bump.result }}
           IMAGE_REFS: ${{ needs.bump.outputs.image_refs }}
           IMAGE_REFS_COUNT: ${{ needs.bump.outputs.image_refs_count }}
+          SYNC_RESULT: ${{ needs.sync.result }}
+          LIVE_IMAGES: ${{ needs.sync.outputs.images }}
+          LIVE_IMAGES_COUNT: ${{ needs.sync.outputs.images_count }}
         run: |
           set -euo pipefail
           mapfile -t regs < <(jq -r '.[].docker_registry | select(startswith("ghcr.io/"))' <<< "$MATRIX" | sort -u)
           if [[ ${#regs[@]} -eq 0 ]]; then echo "▸ no ghcr.io image in this run — nothing to prune"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if [[ "$BUMP_RESULT" == "success" ]]; then
-            got=$(awk 'NF' <<< "${IMAGE_REFS:-}" | wc -l | tr -d ' ')
-            if [[ -z "$IMAGE_REFS_COUNT" || "$got" != "$IMAGE_REFS_COUNT" ]]; then
-              echo "::warning::the image references of the chart did not arrive complete (${got} of ${IMAGE_REFS_COUNT:-unknown}) — nothing is pruned"
-              { echo "skip=true"; echo "note=nothing pruned: the image references of the chart are incomplete"; } >> "$GITHUB_OUTPUT"; exit 0
-            fi
-          fi
+          arrived() { # <what> <lines> <count>
+            local got; got=$(awk 'NF' <<< "$2" | wc -l | tr -d ' ')
+            if [[ -n "$3" && "$got" == "$3" ]]; then return 0; fi
+            echo "::warning::$1 did not arrive complete (${got} of ${3:-unknown}) — nothing is pruned"
+            { echo "skip=true"; echo "note=nothing pruned: $1 are incomplete"; } >> "$GITHUB_OUTPUT"; exit 0
+          }
+          [[ "$BUMP_RESULT" != "success" ]] || arrived "the image references of the chart" "${IMAGE_REFS:-}" "$IMAGE_REFS_COUNT"
+          [[ "$SYNC_RESULT" != "success" ]] || arrived "the images ArgoCD reports as running" "${LIVE_IMAGES:-}" "$LIVE_IMAGES_COUNT"
           mapfile -t accounts < <(printf '%s\n' "${regs[@]}" | sed 's|^ghcr.io/||; s|/.*||' | sort -u)
           if [[ ${#accounts[@]} -ne 1 ]]; then
             echo "::error::components span several registry accounts (${accounts[*]}); cleanup supports one"
@@ -681,12 +685,19 @@ jobs:
             protection="!latest"
             while IFS= read -r t; do t="${t//[[:space:]]/}"; [[ -n "$t" ]] && protection+=" !${t}"; done <<< "${TAGS_EXTRA:-}"
           fi
-          while IFS='|' read -r r t; do
-            [[ "$t" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]] || continue
+          declare -A kept=()
+          keep() { # <why> <repository> <tag>
+            local reg
+            if [[ ! "$3" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ || -n "${kept[$3]:-}" ]]; then return 0; fi
             for reg in "${regs[@]}"; do
-              if [[ -z "$r" || "${r,,}" == "${reg,,}" ]]; then protection+=" !${t}"; echo "▸ kept, the chart names it: ${r:-<any image>}:${t}"; break; fi
+              if [[ -z "$2" || "${2,,}" == "${reg,,}" ]]; then kept[$3]=1; protection+=" !$3"; echo "▸ kept, $1: ${2:-<any image>}:$3"; return 0; fi
             done
-          done <<< "${IMAGE_REFS:-}"
+          }
+          while IFS='|' read -r r t; do keep "the chart names it" "$r" "$t"; done <<< "${IMAGE_REFS:-}"
+          while IFS= read -r img; do
+            img=${img%%@*}
+            if [[ "$img" == *:* ]]; then keep "a pod runs it" "${img%:*}" "${img##*:}"; fi
+          done <<< "${LIVE_IMAGES:-}"
           echo "protection=${protection}" >> "$GITHUB_OUTPUT"
 
       - name: Prune image versions
@@ -846,12 +857,15 @@ jobs:
           [[ -n "$bumped" ]] || { echo "::error::no component of this run was built — nothing to bump"; exit 1; }
           bumped=$(tr ',' '\n' <<< "$bumped" | awk 'NF && !seen[$0]++' | paste -sd, -)
 
-          image_refs() { # <file>: "<path>|<repository>|<tag>" for every image the file names; repository is empty where only the tag is overridden
-            yq -N -r 'explode(.) | .. | select(tag == "!!map") | select(has("tag")) | select(.tag | tag != "!!map" and tag != "!!seq" and tag != "!!null") | [(path | join(".")), (.repository // ""), .tag] | join("|")' "$1"
+          image_refs() { # <file>: "<path>|<repository>|<tag>" for every image the file names, as a repository/tag pair or as one "repository:tag" string; repository is empty where only the tag is overridden
+            yq -N -r 'explode(.) | .. | (
+              (select(tag == "!!map") | select(has("tag")) | select(.tag | (tag != "!!map" and tag != "!!seq" and tag != "!!null")) | [(path | join(".")), (.repository // ""), .tag]),
+              (select(tag == "!!str") | select(test("^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?/[A-Za-z0-9._/-]+:[A-Za-z0-9_][A-Za-z0-9._-]*$")) | [(path | join(".")), sub(":[^:/]+$", ""), sub("^.*:", "")])
+            ) | join("|")' "$1"
           }
           while IFS='|' read -r where r t; do
             [[ -n "$r" && -n "$t" && -n "${built[$r]:-}" && "$t" != "${built[$r]}" && "$t" != *latest ]] || continue
-            echo "::warning::${values}: ${where:-.} stays on ${r}:${t} while this run deploys ${built[$r]} — add it to chart_init_containers or chart_components_extra, or drop it from the chart"
+            echo "::warning::${values}: ${where:-.} stays on ${r}:${t} while this run deploys ${built[$r]} — the bump does not reach it: list the container in chart_init_containers or chart_components_extra, or update it by hand"
           done < <(image_refs "$values")
 
           refs=""; refs_count=""; refs_ok=true
@@ -908,6 +922,8 @@ jobs:
       id-token: write
     outputs:
       results: ${{ steps.wait.outputs.results }}
+      images: ${{ steps.wait.outputs.images }}
+      images_count: ${{ steps.wait.outputs.images_count }}
     env:
       ARGOCD_SERVER: ${{ inputs.argocd_server }}
     steps:
