@@ -138,6 +138,10 @@ its component `main`.
 | `chart_init_containers` | | initContainers that get the same image |
 | `chart_components_extra` | | other `.components.*` that get the same image |
 
+Component, initContainer, `app`, `team` and `env` names hold only letters, digits, `-` and `_`
+(the last three also `.`); they become file paths, Vault paths and `yq` expressions, so the
+run stops on anything else.
+
 Two components with the same image would overwrite each other, so the run stops:
 give one its own `docker_registry`, or merge them with `chart_components_extra`.
 

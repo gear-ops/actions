@@ -212,7 +212,13 @@ jobs:
           IN_APP: ${{ inputs.app }}
           IN_TEAM: ${{ inputs.team }}
           IN_CHARTS_REPO: ${{ inputs.charts_repo }}
+          IN_VALUES_PATH: ${{ inputs.charts_values_path }}
+          IN_ARGOCD_SERVER: ${{ inputs.argocd_server }}
           IN_VAULT_SERVER: ${{ inputs.vault_server }}
+          IN_VAULT_ROLE: ${{ inputs.vault_role }}
+          IN_VAULT_AUTH_PATH: ${{ inputs.vault_auth_path }}
+          IN_VAULT_MOUNT_CI: ${{ inputs.vault_mount_ci }}
+          IN_VAULT_MOUNT_RUNTIME: ${{ inputs.vault_mount_runtime }}
           EVENT: ${{ github.event_name }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
@@ -240,6 +246,18 @@ jobs:
           if [[ -z "$envn" ]]; then
             if in_csv "$IN_PROD_BRANCHES" "$REF_NAME"; then envn=$(strip "$IN_PROD_ENV"); else envn=$(strip "$IN_DEFAULT_ENV"); fi
           fi
+          named() { [[ "$2" =~ ^[A-Za-z0-9]([A-Za-z0-9_${3:-}-]*[A-Za-z0-9])?$ ]] || { echo "::error::$1 '$2' may hold only letters, digits and ${3:+. }- _ in between"; exit 1; }; }
+          named app "$IN_APP" .; named env "$envn" .
+          [[ -z "$(strip "$IN_TEAM")" ]] || named team "$(strip "$IN_TEAM")" .
+          shaped() { [[ -z "$2" || "$2" =~ $3 ]] || { echo "::error::$1 '$2' is not $4"; exit 1; }; }
+          shaped vault_server "$(strip "$IN_VAULT_SERVER")" '^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$' "an http(s) URL without a query or credentials"
+          shaped argocd_server "$(strip "$IN_ARGOCD_SERVER")" '^[A-Za-z0-9.-]+(:[0-9]+)?$' "a host name with an optional port"
+          shaped charts_repo "$(strip "$IN_CHARTS_REPO")" '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' "an owner/repository pair"
+          shaped vault_role "$(strip "$IN_VAULT_ROLE")" '^[A-Za-z0-9._-]+$' "a role name"
+          for p in "vault_auth_path|$(strip "$IN_VAULT_AUTH_PATH")" "vault_mount_ci|$(strip "$IN_VAULT_MOUNT_CI")" "vault_mount_runtime|$(strip "$IN_VAULT_MOUNT_RUNTIME")" "charts_values_path|$(strip "$IN_VALUES_PATH")"; do
+            shaped "${p%%|*}" "${p#*|}" '^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$' "a relative path"
+            [[ "/${p#*|}/" != */../* && "/${p#*|}/" != */./* ]] || { echo "::error::${p%%|*} '${p#*|}' may not hold . or .. segments"; exit 1; }
+          done
 
           # monorepo: app name not in repo name → shared ghcr.io/<repo> image
           repo_lc=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
@@ -271,6 +289,8 @@ jobs:
           for i in $(seq 0 $((n-1))); do
             c=$(jq -c ".[$i]" "$comp")
             name=$(jq -r '.name // empty' <<< "$c"); [[ -n "$name" ]] || { echo "::error::components[$i] has no name"; exit 1; }
+            named "components[$i].name" "$name"
+            while IFS= read -r n; do named "${name}: chart name" "$n"; done < <(jq -r '(.chart_init_containers // ""), (.chart_components_extra // "") | split("\n")[] | gsub("\\s";"") | select(length>0)' <<< "$c")
             flag_key="deploy"; [[ "$name" != "main" ]] && flag_key="deploy_${name}"
             flag=$(jq -r --arg k "$flag_key" '.[$k] // empty' <<< "$DISPATCH_INPUTS")
             if [[ "$EVENT" == "workflow_dispatch" && "$flag" == "false" ]]; then
@@ -288,6 +308,7 @@ jobs:
               registry="ghcr.io/${repo_lc}"
               [[ "$name" != "main" && "${repo_lc##*/}" != "$name" ]] && registry="${registry}-${name}"
             fi
+            [[ "$registry" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*$ ]] || { echo "::error::${name}: docker_registry '${registry}' is not an image name"; exit 1; }
             tags="${registry}:${tag}"
             [[ -n "$latest" ]] && tags+=$'\n'"${registry}:${latest}"
             while IFS= read -r t; do
@@ -296,11 +317,11 @@ jobs:
               tags+=$'\n'"${registry}:${t}"
             done <<< "${IN_TAGS_EXTRA:-}"
 
-            entry=$(jq -n --argjson c "$c" --arg registry "$registry" --arg image "${registry}:${tag}" --arg tags "$tags" '{
-              name: $c.name,
+            entry=$(jq -n --argjson c "$c" --arg name "$name" --arg registry "$registry" --arg image "${registry}:${tag}" --arg tags "$tags" '{
+              name: $name,
               docker_context: ($c.docker_context // "."),
               docker_file: ((($c.docker_context // ".") + "/" + ($c.docker_file // "Dockerfile")) | sub("^\\./";"")),
-              label: (if $c.name == "main" then "" else " " + $c.name end),
+              label: (if $name == "main" then "" else " " + $name end),
               docker_registry: $registry,
               docker_image: $image,
               docker_tags: $tags,
@@ -381,7 +402,10 @@ jobs:
           if [[ -z "$CHARTS_REPO" ]]; then echo "▸ charts_repo not set — build only, no bump and no sync"; emit true 0 ""; exit 0; fi
           if [[ -z "$ARGOCD_SERVER" ]]; then echo "▸ argocd_server not set — no gate, no sync"; emit true 0 ""; exit 0; fi
           [[ -n "${ARGOCD_AUTH_TOKEN:-}" ]] || { echo "::error::argocd_server is set but ARGOCD_AUTH_TOKEN is in neither Vault <vault_mount_ci>/ci/shared nor the secret"; exit 1; }
-          if [[ -n "$APP_OVERRIDE" ]]; then echo "▸ explicit argocd_app='${APP_OVERRIDE}'"; emit true 1 "$APP_OVERRIDE"; exit 0; fi
+          if [[ -n "$APP_OVERRIDE" ]]; then
+            [[ "$APP_OVERRIDE" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]] || { echo "::error::argocd_app '${APP_OVERRIDE}' is not an Application name"; exit 1; }
+            echo "▸ explicit argocd_app='${APP_OVERRIDE}'"; emit true 1 "$APP_OVERRIDE"; exit 0
+          fi
 
           selector="app=$(strip "$APP_NAME"),env=$(strip "$ENV"),team=$(strip "$TEAM")"
           resp=$(curl -sS -G -w '\n%{http_code}' -H "Authorization: Bearer $ARGOCD_AUTH_TOKEN" \
@@ -390,6 +414,8 @@ jobs:
           [[ "$code" == "200" ]] || { echo "::error::ArgoCD API returned HTTP ${code:-000} for selector '${selector}'"; exit 1; }
 
           apps=$(printf '%s' "$body" | jq -r '.items[]?.metadata.name // empty')
+          odd=$(grep -vE '^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$' <<< "$apps" | awk 'NF' | head -n1 || true)
+          [[ -z "$odd" ]] || { echo "::error::ArgoCD returned a name that is not an Application name"; exit 1; }
           count=$(printf '%s\n' "$apps" | awk 'NF' | wc -l | tr -d ' ')
           if [[ -z "$apps" ]]; then
             echo "::notice::No ArgoCD Application matches '${selector}' — env '${ENV}' is not deployed; nothing to build"
