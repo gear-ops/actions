@@ -162,6 +162,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      actions: read
       id-token: write
     outputs:
       env: ${{ steps.plan.outputs.env }}
@@ -187,14 +188,50 @@ jobs:
             [ .[] | select((.paths // "") != "")
                   | {(.name): ((.paths|split("\n")|map(sub("^\\s+";"")|sub("\\s+$";""))|map(select(length>0))))} ] | add // {}')
           if [[ "$(jq 'length' <<< "$f")" == "0" ]]; then echo "▸ no component declares paths — filtering skipped"; exit 0; fi
-          { echo "yaml<<__EOF__"; yq -P '.' <<< "$f"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
+          delim="EOF_$(openssl rand -hex 16)"
+          { echo "yaml<<${delim}"; yq -P '.' <<< "$f"; echo "$delim"; } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the base of the path filter
+        id: base
+        if: ${{ steps.filters.outputs.yaml != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          delivered='
+            [.jobs[] | {seg: (.name | split(" / ") | last), c: .conclusion}]
+            | ([.[] | select(.seg == "plan")] | length > 0 and all(.c == "success"))
+              and ([.[] | select(.seg | test("^build( |$)"))] | all(.c == "success" or .c == "skipped"))
+              and ([.[] | select(.seg == "bump")] | all(.c == "success" or .c == "skipped"))'
+          wf=${WORKFLOW_REF%%@*}; wf=${wf##*/}; api="repos/${GITHUB_REPOSITORY}"
+          base=""
+          while IFS=$'\t' read -r id sha conclusion; do
+            [[ "$id" != "$GITHUB_RUN_ID" ]] || continue
+            if [[ "$conclusion" != "success" ]]; then
+              [[ "$conclusion" == "failure" && "$(gh api "${api}/actions/runs/${id}/jobs?per_page=100" --jq "$delivered" 2>/dev/null)" == "true" ]] || continue
+            fi
+            base=$sha; break
+          done < <(gh api -X GET "${api}/actions/workflows/${wf}/runs" -f branch="$BRANCH" -f event=push -f status=completed -F per_page=20 \
+                     --jq '.workflow_runs[] | [.id, .head_sha, .conclusion] | @tsv' 2>/dev/null || true)
+          if [[ -n "$base" ]]; then
+            rel=$(gh api "${api}/compare/${base}...${GITHUB_SHA}?per_page=1" --jq .status 2>/dev/null) || rel=""
+            [[ "$rel" == "ahead" || "$rel" == "identical" ]] || { echo "▸ ${base} is not behind this push (${rel:-unknown})"; base=""; }
+          fi
+          if [[ -n "$base" ]]; then
+            echo "▸ changes are counted from ${base}, the last push whose builds all reached the chart"
+          else
+            base="$GITHUB_REF"; echo "▸ no such push of ${wf} on ${BRANCH} — changes are counted from the previous push"
+          fi
+          echo "ref=${base}" >> "$GITHUB_OUTPUT"
 
       - name: Detect changed components
         id: changed
         if: ${{ steps.filters.outputs.yaml != '' }}
         uses: dorny/paths-filter@v4
         with:
-          base: ${{ github.ref }}
+          base: ${{ steps.base.outputs.ref }}
           filters: ${{ steps.filters.outputs.yaml }}
 
       - name: Resolve plan

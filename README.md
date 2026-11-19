@@ -134,7 +134,7 @@ its component `main`.
 | `docker_file` | `Dockerfile` | Dockerfile path inside the context |
 | `docker_registry` | `ghcr.io/<owner>/<repo>-<name>`; without `-<name>` for `main` or a component named after the repo | image without tag |
 | `docker_build_args` | | multiline `KEY=VALUE`; Vault wins on the same key |
-| `paths` | | multiline globs; on a push the component builds only if a file changed since the previous push to that branch matches |
+| `paths` | | multiline globs; on a push the component builds only if a matching file changed since the last delivered push of that branch (see Notes) |
 | `chart_init_containers` | | initContainers that get the same image |
 | `chart_components_extra` | | other `.components.*` that get the same image |
 
@@ -226,6 +226,10 @@ missing there, or a failed login, falls back to the secret of the same purpose.
 
 ### Notes
 
+- `paths` compares with the last push of the branch that was delivered: `plan` passed, every
+  build passed and `bump` wrote them to the chart. A push that failed earlier, was cancelled
+  or was replaced in the queue is therefore built again with the next one. Without such a push
+  among the last 20 runs, or after a history rewrite, the previous push is the base.
 - Visibility: an image pushed with `GITHUB_TOKEN` takes the visibility of its
   repository and no API can change it, so a wrong one is fixed once by hand on
   the package settings page; the check only reports it.
