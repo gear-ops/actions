@@ -288,3 +288,8 @@ containers pinned by digest instead of through an action: `docker.io/aquasec/tri
 protected). The failure alert is a plain request to the Telegram Bot API. `renovate.json` keeps the
 pins current: an update waits a week after its release, and a digest that moves under an unchanged
 version is never proposed on its own.
+
+A caller whose Actions policy is "Allow select actions" has to allow, besides this workflow, the
+third-party actions by any ref - `docker/build-push-action@*`, `docker/login-action@*`,
+`docker/setup-buildx-action@*`, `dorny/paths-filter@*`: a pattern with a tag does not match a
+commit pin, and the pin moves with every update.
