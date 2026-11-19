@@ -595,21 +595,20 @@ jobs:
 
       - name: Persist build meta
         if: always()
+        env:
+          APP: ${{ inputs.app }}
+          COMPONENT: ${{ matrix.name }}
+          STATUS: ${{ job.status }}
         run: |
-          {
-            echo "STATUS=${{ job.status }}"
-            echo "COMPONENT=${{ matrix.name }}"
-            echo "IMAGE=${{ matrix.docker_image }}"
-            echo "INIT_CONTAINERS=${{ matrix.chart_init_containers }}"
-            echo "COMPONENTS_EXTRA=${{ matrix.chart_components_extra }}"
-          } > build-meta.env
+          dir="${RUNNER_TEMP}/build-meta/$(printf '%s' "$APP" | tr -d '[:space:]')/${COMPONENT}"
+          mkdir -p "$dir" && echo "STATUS=${STATUS}" > "${dir}/build-meta.env"
 
       - name: Upload build meta
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: build-meta-${{ inputs.app }}-${{ matrix.name }}
-          path: build-meta.env
+          path: ${{ runner.temp }}/build-meta
           retention-days: 1
           if-no-files-found: error
           overwrite: true
@@ -764,6 +763,7 @@ jobs:
         with:
           pattern: build-meta-${{ inputs.app }}-*
           path: meta
+          merge-multiple: true
 
       - name: Bump image tags
         id: bump
@@ -774,6 +774,7 @@ jobs:
           ENV: ${{ needs.plan.outputs.env }}
           OVERRIDE: ${{ inputs.charts_values_path }}
           CHARTS_REPO: ${{ inputs.charts_repo }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
         run: |
           set -euo pipefail
           strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
@@ -786,9 +787,12 @@ jobs:
           else values="$chart_dir/values.yaml"; fi
           [[ -f "$values" ]] || { echo "::error::Values file '$values' not found"; exit 1; }
 
+          replay="${RUNNER_TEMP}/bump-replay.sh"; : > "$replay"
           set_image() { # <component> <container-path> <repo> <tag>
-            yq -i ".components.$1.$2.image.repository = \"$3\"" "$values"
-            yq -i ".components.$1.$2.image.tag = \"$4\"" "$values"
+            local e
+            for e in ".components.$1.$2.image.repository = \"$3\"" ".components.$1.$2.image.tag = \"$4\""; do
+              yq -i "$e" "$values"; printf 'yq -i %q %q\n' "$e" "$values" >> "$replay"
+            done
             echo "▸ components.$1.$2 → $3:$4"
           }
           require_component() {
@@ -796,22 +800,21 @@ jobs:
             [[ -n "$v" && "$v" != "null" ]] || { echo "::error::components.$1 not found in ${values}"; exit 1; }
           }
 
-          mapfile -t metas < <(find ../meta -name build-meta.env -type f | sort)
-          [[ ${#metas[@]} -gt 0 ]] || { echo "::error::no build-meta artifacts found"; exit 1; }
+          mapfile -t rows < <(jq -r '.[] | [.name, .docker_image, .chart_init_containers, .chart_components_extra] | join("|")' <<< "$MATRIX")
 
           bumped=""; declare -A built=()
-          for f in "${metas[@]}"; do
-            unset STATUS COMPONENT IMAGE INIT_CONTAINERS COMPONENTS_EXTRA
-            # shellcheck disable=SC1090
-            source "$f"
-            [[ "${STATUS:-}" == "success" ]] || { echo "::warning::build of ${COMPONENT:-?} ended as ${STATUS:-unknown} — its tag stays as it is"; continue; }
-            repo="${IMAGE%:*}"; tag="${IMAGE##*:}"; built["$repo"]="$tag"
-            require_component "$COMPONENT"
-            set_image "$COMPONENT" "containers.main" "$repo" "$tag"
-            bumped+="${bumped:+,}${COMPONENT}"
-            IFS=',' read -ra ics <<< "${INIT_CONTAINERS:-}"
-            for ic in "${ics[@]}"; do [[ -n "$ic" ]] && set_image "$COMPONENT" "initContainers.${ic}" "$repo" "$tag"; done
-            IFS=',' read -ra extras <<< "${COMPONENTS_EXTRA:-}"
+          for row in "${rows[@]}"; do
+            IFS='|' read -r name image ics_csv extras_csv <<< "$row"
+            f="../meta/${APP}/${name}/build-meta.env"; status=""
+            [[ -f "$f" ]] && status=$(sed -n 's/^STATUS=//p' "$f" | head -n1)
+            [[ "$status" == "success" ]] || { echo "::warning::build of ${name} ended as ${status:-unknown} — its tag stays as it is"; continue; }
+            repo="${image%:*}"; tag="${image##*:}"; built["$repo"]="$tag"
+            require_component "$name"
+            set_image "$name" "containers.main" "$repo" "$tag"
+            bumped+="${bumped:+,}${name}"
+            IFS=',' read -ra ics <<< "$ics_csv"
+            for ic in "${ics[@]}"; do [[ -n "$ic" ]] && set_image "$name" "initContainers.${ic}" "$repo" "$tag"; done
+            IFS=',' read -ra extras <<< "$extras_csv"
             for extra in "${extras[@]}"; do
               [[ -n "$extra" ]] || continue
               require_component "$extra"
@@ -824,7 +827,7 @@ jobs:
               done
             done
           done
-          [[ -n "$bumped" ]] || { echo "::error::every component build-meta reports failure — nothing to bump"; exit 1; }
+          [[ -n "$bumped" ]] || { echo "::error::no component of this run was built — nothing to bump"; exit 1; }
           bumped=$(tr ',' '\n' <<< "$bumped" | awk 'NF && !seen[$0]++' | paste -sd, -)
 
           image_refs() { # <file>: "<path>|<repository>|<tag>" for every image the file names; repository is empty where only the tag is overridden
@@ -867,7 +870,15 @@ jobs:
           if git diff --quiet; then echo "▸ values already carry this tag — nothing to commit"; exit 0; fi
           git commit -am "$MESSAGE"
           for i in 1 2 3 4 5; do
-            git pull --rebase --autostash && git push && exit 0
+            if ! git pull --rebase --autostash; then
+              git rebase --abort 2>/dev/null || true
+              git reset -q --hard '@{upstream}'
+              bash -eo pipefail "${RUNNER_TEMP}/bump-replay.sh"
+              if git diff --quiet; then echo "▸ the chart already carries these tags — nothing to push"; exit 0; fi
+              git commit -qam "$MESSAGE"
+              echo "▸ another run changed the same lines — the tags are written again on top of it"
+            fi
+            git push && exit 0
             echo "▸ push attempt $i failed, retrying"; sleep $((i*3))
           done
           echo "::error::could not push the bump commit after 5 attempts"; exit 1
@@ -968,6 +979,7 @@ jobs:
         with:
           pattern: build-meta-${{ inputs.app }}-*
           path: meta
+          merge-multiple: true
         continue-on-error: true
 
       - name: Write summary
@@ -1027,7 +1039,7 @@ jobs:
 
           while IFS=$'\t' read -r name image; do
             [[ -z "$name" ]] && continue
-            st="$BUILD_RESULT"; f="meta/build-meta-${APP}-${name}/build-meta.env"
+            st="$BUILD_RESULT"; f="meta/$(printf '%s' "$APP" | tr -d '[:space:]')/${name}/build-meta.env"
             [[ -f "$f" ]] && st=$(sed -n 's/^STATUS=//p' "$f")
             lbl="build"; [[ "$name" != "main" ]] && lbl="build ${name}"
             if [[ "$st" == "success" ]]; then row "🐳 Build \`${name}\`" "✅" "\`${image}\`"
