@@ -910,7 +910,6 @@ jobs:
       results: ${{ steps.wait.outputs.results }}
     env:
       ARGOCD_SERVER: ${{ inputs.argocd_server }}
-      ARGOCD_OPTS: --grpc-web
     steps:
       - name: Read CI credentials from Vault
         env:
@@ -953,39 +952,91 @@ jobs:
             if [[ -n "${!fallback_var:-}" ]]; then export_env "$name" "${!fallback_var}"; echo "▸ $name from the secret"; fi
           done
 
-      - name: Install argocd CLI
-        run: |
-          set -euo pipefail
-          case "$(uname -m)" in
-            x86_64) arch=amd64 ;;
-            aarch64|arm64) arch=arm64 ;;
-            *) echo "::error::no argocd CLI for runner architecture $(uname -m)"; exit 1 ;;
-          esac
-          mkdir -p "${RUNNER_TEMP}/bin"
-          curl -fsSL -o "${RUNNER_TEMP}/bin/argocd" "https://${ARGOCD_SERVER}/download/argocd-linux-${arch}"
-          chmod +x "${RUNNER_TEMP}/bin/argocd"
-          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
-          "${RUNNER_TEMP}/bin/argocd" version --client
-
-      - name: Sync and wait for health
+      - name: Sync, wait for health and list the running images
         id: wait
         env:
           APPS: ${{ needs.plan.outputs.apps }}
+          APP_NAME: ${{ inputs.app }}
+          TEAM: ${{ inputs.team }}
           TIMEOUT: ${{ inputs.argocd_timeout }}
         run: |
           set -euo pipefail
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          put() { local d; d="EOF_$(openssl rand -hex 16)"; { echo "$1<<$d"; printf '%s\n' "$2"; echo "$d"; } >> "$GITHUB_OUTPUT"; }
+          server=$(strip "$ARGOCD_SERVER"); token=$(strip "${ARGOCD_AUTH_TOKEN:-}")
+          [[ -n "$token" ]] || { echo "::error::argocd_server is set but ARGOCD_AUTH_TOKEN is in neither Vault <vault_mount_ci>/ci/shared nor the secret"; exit 1; }
+          api() { # <method> <path> [json body]: the answer on stdout, non-zero unless the status is 2xx
+            local out code args=(-sS -X "$1" -w '\n%{http_code}' -H "Authorization: Bearer ${token}")
+            [[ $# -lt 3 ]] || args+=(-H "Content-Type: application/json" --data "$3")
+            out=$(curl "${args[@]}" "https://${server}/api/v1/$2") || return 1
+            code=${out##*$'\n'}; out=${out%$'\n'*}
+            if [[ "$code" == 2?? ]]; then printf '%s' "$out"; return 0; fi
+            echo "ArgoCD answered HTTP ${code}: $(jq -r '.message // .error // empty' <<< "$out" 2>/dev/null | head -c 300)" >&2; return 1
+          }
+          sync_app() { # <app>: start a sync, wait for it, then wait until the app is Synced and Healthy
+            local app=$1 st prev deadline err started phase left sync health seen=""
+            st=$(api GET "applications/${app}") || return 1
+            prev=$(jq -r '.status.operationState.startedAt // ""' <<< "$st")
+            deadline=$((SECONDS + TIMEOUT))
+            until err=$(api POST "applications/${app}/sync" '{}' 2>&1 >/dev/null); do
+              if [[ "$err" != *"another operation is already in progress"* ]] || (( SECONDS >= deadline )); then echo "$err"; return 1; fi
+              sleep 5
+            done
+            while :; do
+              st=$(api GET "applications/${app}") || return 1
+              started=$(jq -r '.status.operationState.startedAt // ""' <<< "$st"); phase=$(jq -r '.status.operationState.phase // ""' <<< "$st")
+              if [[ "$started" != "$prev" ]]; then
+                case "$phase" in
+                  Succeeded) break ;;
+                  Failed|Error) echo "sync ${phase}: $(jq -r '.status.operationState.message // ""' <<< "$st")"; return 1 ;;
+                esac
+              fi
+              (( SECONDS < deadline )) || { echo "the sync did not finish in ${TIMEOUT}s"; return 1; }
+              sleep 5
+            done
+            echo "sync: $(jq -r '.status.operationState.message // "done"' <<< "$st")"
+            left=$(jq -r '[.status.operationState.syncResult.resources[]? | select(.status == "PruneSkipped") | .kind + "/" + .name] | join(", ")' <<< "$st")
+            [[ -z "$left" ]] || { echo "left in the cluster though the chart no longer has them — prune or delete: ${left}"; return 1; }
+            deadline=$((SECONDS + TIMEOUT))
+            while :; do
+              st=$(api GET "applications/${app}") || return 1
+              if [[ "$(jq -r '(.status.reconciledAt // "") >= (.status.operationState.finishedAt // "~")' <<< "$st")" == "true" ]]; then
+                sync=$(jq -r '.status.sync.status // "Unknown"' <<< "$st"); health=$(jq -r '.status.health.status // "Unknown"' <<< "$st")
+                [[ "$seen" == "${sync}/${health}" ]] || { seen="${sync}/${health}"; echo "state: ${sync}, ${health}"; }
+                if [[ "$sync" == "Synced" && "$health" == "Healthy" ]]; then return 0; fi
+              fi
+              (( SECONDS < deadline )) || { echo "not Synced and Healthy after ${TIMEOUT}s"; return 1; }
+              sleep 5
+            done
+          }
+
           mapfile -t apps < <(printf '%s\n' "$APPS" | awk 'NF')
           rc=0; results=""
           for app in "${apps[@]}"; do
             echo ""; echo "▸ $app"
-            if argocd app sync "$app" --timeout "$TIMEOUT" && argocd app wait "$app" --sync --health --timeout "$TIMEOUT"; then
+            if [[ "$app" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]] && sync_app "$app"; then
               results+="${app}|ok"$'\n'
             else
               echo "::error::sync/health failed for $app"; results+="${app}|fail"$'\n'; rc=1
             fi
           done
-          { echo "results<<__EOF__"; printf '%s' "$results"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
-          exit $rc
+          put results "${results%$'\n'}"
+          [[ $rc -eq 0 ]] || exit "$rc"
+
+          selector="app=$(strip "$APP_NAME"),team=$(strip "$TEAM")"
+          live() {
+            local app
+            api GET "applications?selector=$(jq -rn --arg s "$selector" '$s | @uri')" | jq -r '.items[]?.status.summary.images[]?' || return 1
+            for app in "${apps[@]}"; do api GET "applications/${app}" | jq -r '.status.summary.images[]?' || return 1; done
+          }
+          count=""
+          if images=$(live | sort -u); then
+            count=$(awk 'NF' <<< "$images" | wc -l | tr -d ' ')
+            echo ""; echo "▸ ${count} image(s) run in the Applications labelled ${selector}"
+          else
+            images=""; echo "::warning::the running images could not be read from ArgoCD — cleanup will not prune"
+          fi
+          echo "images_count=$count" >> "$GITHUB_OUTPUT"; put images "$images"
 
   report:
     needs: [plan, build, cleanup, bump, sync]

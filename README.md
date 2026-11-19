@@ -205,8 +205,15 @@ components:
         image: { repository: same, tag: same }
 ```
 
-The commit is plain `git`, so the token never reaches a third-party action.
-`sync` downloads the `argocd` CLI from `argocd_server`, so the runner must reach it.
+The commit is plain `git`, so the token never reaches a third-party action, and it goes
+straight to the default branch of `charts_repo`: a branch protection there has to let the
+deploy key or the token push. When another run has changed the same lines meanwhile, the
+tags are written again on top of its commit: the later push wins, and a `concurrency` group
+in the caller keeps one branch in order.
+
+`sync` calls the REST API of `argocd_server` over HTTPS with `curl`; it downloads and runs
+nothing from that host. The Application needs the labels `app`, `env` and `team`, or its
+name in `argocd_app`.
 
 ### Vault
 
