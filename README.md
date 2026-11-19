@@ -171,7 +171,9 @@ give one its own `docker_registry`, or merge them with `chart_components_extra`.
    is built if no Application has the labels `app`, `env` and `team`.
 2. `build` builds and pushes each component, with build-args from
    `docker_build_args` and Vault.
-3. `bump` writes the tag into the GitOps repo and pushes one commit.
+3. `bump` writes the tag into the GitOps repo and pushes one commit. A component
+   whose build failed keeps its tag; the others are still bumped and synced, and
+   the run stays failed.
 4. `sync` syncs the Applications and waits until they are healthy.
 5. `cleanup` keeps the last `cleanup_keep` versions of each `ghcr.io` image and
    every tag the chart names.

@@ -630,7 +630,11 @@ jobs:
 
   bump:
     needs: [plan, build]
-    if: ${{ inputs.charts_repo != '' && needs.build.result == 'success' }}
+    if: >-
+      ${{ !cancelled() && inputs.charts_repo != '' && (
+            needs.build.result == 'success'
+            || (needs.build.result != 'skipped' && needs.plan.outputs.count != '1')
+          ) }}
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 10
     permissions:
@@ -737,7 +741,7 @@ jobs:
             unset STATUS COMPONENT IMAGE INIT_CONTAINERS COMPONENTS_EXTRA
             # shellcheck disable=SC1090
             source "$f"
-            [[ "${STATUS:-}" == "success" ]] || continue
+            [[ "${STATUS:-}" == "success" ]] || { echo "::warning::build of ${COMPONENT:-?} ended as ${STATUS:-unknown} — its tag stays as it is"; continue; }
             repo="${IMAGE%:*}"; tag="${IMAGE##*:}"; built["$repo"]="$tag"
             require_component "$COMPONENT"
             set_image "$COMPONENT" "containers.main" "$repo" "$tag"
@@ -807,7 +811,7 @@ jobs:
 
   sync:
     needs: [plan, bump]
-    if: ${{ inputs.argocd_server != '' && needs.bump.result == 'success' && needs.plan.outputs.apps != '' }}
+    if: ${{ !cancelled() && inputs.argocd_server != '' && needs.bump.result == 'success' && needs.plan.outputs.apps != '' }}
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 15
     permissions:
