@@ -1,0 +1,34 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Runs from gear-ops/IaC's .github/workflows/renovate.yaml. Actions are pinned by commit and the images a step runs with docker by digest. Updates are grouped into one PR a week and nothing merges by itself.",
+  "extends": ["config:recommended", "group:allNonMajor", "helpers:pinGitHubActionDigestsToSemver"],
+  "schedule": ["* 0-7 * * 1"],
+  "labels": ["dependencies"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "An image a step runs with docker: <NAME>_IMAGE: <image>:<tag>@sha256:<digest>",
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": ["[A-Z_]+_IMAGE: (?<depName>[^\\s:@]+):(?<currentValue>[^\\s:@]+)@(?<currentDigest>sha256:[a-f0-9]{64})"],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "An action or an image follows a release a week after it came out: a hijacked tag is usually found within days",
+      "matchManagers": ["github-actions", "custom.regex"],
+      "minimumReleaseAge": "7 days"
+    },
+    {
+      "description": "A digest that changes under an unchanged version means the tag was moved: it waits for its checkbox in the Dependency Dashboard",
+      "matchUpdateTypes": ["digest"],
+      "dependencyDashboardApproval": true,
+      "addLabels": ["tag-moved"]
+    },
+    {
+      "description": "Majors wait for their checkbox in the Dependency Dashboard",
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}

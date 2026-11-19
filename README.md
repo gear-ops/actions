@@ -281,7 +281,10 @@ stops before the token is sent anywhere.
 | `dorny/paths-filter` | per-component `paths` filter |
 | `docker/setup-buildx-action`, `docker/login-action`, `docker/build-push-action` | build and push |
 | `actions/upload-artifact`, `actions/download-artifact` | component results for bump and report |
-| `snok/container-retention-policy` | GHCR prune by tag, so `latest` stays protected |
-| `appleboy/telegram-action` | failure alert |
 
-Not an action: `docker.io/aquasec/trivy`, the image scanner, pinned by digest in the `scan` job.
+Every action is pinned by commit, with its version in the comment beside it. Two tools run as
+containers pinned by digest instead of through an action: `docker.io/aquasec/trivy` in `scan` and
+`ghcr.io/snok/container-retention-policy` in `cleanup` (GHCR prune by tag, so `latest` stays
+protected). The failure alert is a plain request to the Telegram Bot API. `renovate.json` keeps the
+pins current: an update waits a week after its release, and a digest that moves under an unchanged
+version is never proposed on its own.
