@@ -1248,14 +1248,54 @@ jobs:
     if: failure()
     runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 5
-    permissions: {}
-    env:
-      TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-      TG_CHAT: ${{ secrets.TELEGRAM_CHAT }}
-      TG_THREAD: ${{ secrets.TELEGRAM_THREAD }}
+    permissions:
+      id-token: write
     steps:
+      - name: Read CI credentials from Vault
+        env:
+          VAULT_SERVER: ${{ inputs.vault_server }}
+          VAULT_ROLE: ${{ inputs.vault_role }}
+          VAULT_AUTH_PATH: ${{ inputs.vault_auth_path }}
+          VAULT_MOUNT_CI: ${{ inputs.vault_mount_ci }}
+          WANT: TELEGRAM_TOKEN TELEGRAM_CHAT TELEGRAM_THREAD
+          FALLBACK_TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          FALLBACK_TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
+          FALLBACK_TELEGRAM_THREAD: ${{ secrets.TELEGRAM_THREAD }}
+        run: |
+          set -euo pipefail
+          strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
+          export_env() { # <name> <value>: masked, multi-line safe
+            while IFS= read -r line; do [[ -n "$line" ]] && echo "::add-mask::$line"; done <<< "$2"
+            local delim; delim="EOF_$(openssl rand -hex 8)"
+            { echo "$1<<$delim"; printf '%s\n' "$2"; echo "$delim"; } >> "$GITHUB_ENV"
+          }
+          VAULT_SERVER=$(strip "$VAULT_SERVER"); VAULT_SERVER=${VAULT_SERVER%/}
+          VAULT_ROLE=$(strip "$VAULT_ROLE"); VAULT_AUTH_PATH=$(strip "$VAULT_AUTH_PATH"); VAULT_MOUNT_CI=$(strip "$VAULT_MOUNT_CI")
+          data="{}"
+          if [[ -n "$VAULT_SERVER" && -n "$VAULT_ROLE" && -n "$VAULT_AUTH_PATH" && -n "$VAULT_MOUNT_CI" && -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+            aud=$(jq -rn --arg v "$VAULT_SERVER" '$v | @uri')
+            if jwt=$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${aud}" | jq -er .value) \
+              && token=$(curl -fsSL --data "{\"role\":\"${VAULT_ROLE}\",\"jwt\":\"${jwt}\"}" "${VAULT_SERVER}/v1/auth/${VAULT_AUTH_PATH}/login" | jq -er .auth.client_token); then
+              echo "::add-mask::$token"
+              data=$(curl -fsSL -H "X-Vault-Token: $token" "${VAULT_SERVER}/v1/${VAULT_MOUNT_CI}/data/ci/shared" | jq -c '.data.data | objects') || data=""
+              [[ -n "$data" ]] || data="{}"
+            else
+              echo "::warning::Vault login failed - CI credentials come from secrets"
+            fi
+          fi
+          server=$(strip "${ARGOCD_SERVER:-}"); pinned=$(jq -r '.ARGOCD_SERVER // empty' <<< "$data")
+          if [[ " $WANT " == *" ARGOCD_AUTH_TOKEN "* && -n "$server" && -n "$pinned" && "$pinned" != "$server" ]]; then
+            echo "::error::the ArgoCD token of Vault ${VAULT_MOUNT_CI}/ci/shared belongs to '${pinned}', but argocd_server is '${server}'"; exit 1
+          fi
+          for name in $WANT; do
+            value=$(jq -r --arg n "$name" '.[$n] // empty' <<< "$data")
+            if [[ -n "$value" ]]; then export_env "$name" "$value"; echo "▸ $name from Vault ${VAULT_MOUNT_CI}/ci/shared"; continue; fi
+            fallback_var="FALLBACK_$name"
+            if [[ -n "${!fallback_var:-}" ]]; then export_env "$name" "${!fallback_var}"; echo "▸ $name from the secret"; fi
+          done
+
       - name: Send Telegram notification
-        if: env.TG_TOKEN != ''
+        if: env.TELEGRAM_TOKEN != ''
         env:
           APP: ${{ inputs.team != '' && format('{0}/{1}', inputs.team, inputs.app) || inputs.app }}
           ENV: ${{ needs.plan.outputs.env }}
@@ -1267,6 +1307,6 @@ jobs:
           # shellcheck disable=SC2016
           text=$(printf '🔥 *CI/CD failed*\n\n- app: `%s`\n- env: `%s`\n- repo: `%s`\n- branch: `%s`\n- actor: `%s`\n\n[logs](%s)' \
             "$(clean "$APP")" "$(clean "$ENV")" "$GITHUB_REPOSITORY" "$(clean "$BRANCH")" "$GITHUB_ACTOR" "$LOGS")
-          args=(--data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "parse_mode=Markdown" --data-urlencode "disable_web_page_preview=true" --data-urlencode "text=${text}")
-          [[ -z "$TG_THREAD" ]] || args+=(--data-urlencode "message_thread_id=${TG_THREAD}")
-          curl -fsS -o /dev/null -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" "${args[@]}"
+          args=(--data-urlencode "chat_id=${TELEGRAM_CHAT}" --data-urlencode "parse_mode=Markdown" --data-urlencode "disable_web_page_preview=true" --data-urlencode "text=${text}")
+          [[ -z "${TELEGRAM_THREAD:-}" ]] || args+=(--data-urlencode "message_thread_id=${TELEGRAM_THREAD}")
+          curl -fsS -o /dev/null -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" "${args[@]}"

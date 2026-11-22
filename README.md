@@ -120,7 +120,7 @@ secret below is read only for a field that path does not have.
 | `CHARTS_REPO_TOKEN` | gitops only, deploy, without `CHARTS_REPO_SSH_KEY` in Vault | token with `contents:write` on `charts_repo` |
 | `ARGOCD_AUTH_TOKEN` | deploy, without `ARGOCD_AUTH_TOKEN` in Vault | ArgoCD API token that can list and sync the Applications |
 | `DOCKER_REGISTRY_PASSWORD` | a registry other than `ghcr.io` | registry password |
-| `TELEGRAM_TOKEN`, `TELEGRAM_CHAT`, `TELEGRAM_THREAD` | optional | failure alerts |
+| `TELEGRAM_TOKEN`, `TELEGRAM_CHAT`, `TELEGRAM_THREAD` | failure alerts, without them in Vault | bot token, chat ID, topic ID |
 
 ### Components
 
@@ -237,8 +237,9 @@ of the copy you call, and `runner_environment` = `github-hosted`.
 A missing path means no build-args; any other Vault error fails the build. A value may span
 several lines.
 
-The deploy credentials are fields of `<vault_mount_ci>/ci/shared`: `ARGOCD_AUTH_TOKEN` and
-`CHARTS_REPO_SSH_KEY`, the private half of a deploy key with write access on `charts_repo`. A field
+The deploy credentials are fields of `<vault_mount_ci>/ci/shared`: `ARGOCD_AUTH_TOKEN`,
+`CHARTS_REPO_SSH_KEY`, the private half of a deploy key with write access on `charts_repo`, and
+`TELEGRAM_TOKEN`, `TELEGRAM_CHAT`, `TELEGRAM_THREAD` for the failure alert. A field
 missing there, or a failed login, falls back to the secret of the same purpose. A field
 `ARGOCD_SERVER` next to the token binds it to that host: a run whose `argocd_server` differs
 stops before the token is sent anywhere.
