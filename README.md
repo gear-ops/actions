@@ -163,6 +163,7 @@ give one its own `docker_registry`, or merge them with `chart_components_extra`.
 | `docker_scan` | `true` | scan each image with Trivy; see Notes |
 | `charts_values_path` | `values/<env>.yaml`, else `values.yaml` | values file inside `charts/<team>/<app>/` |
 | `argocd_app` | by labels | Application name instead of the label lookup |
+| `argocd_deployment` | whole Application | sync only this existing Deployment in the destination namespace of `argocd_app` |
 | `argocd_timeout` | `600` | seconds to wait for sync and health |
 | `cleanup_enabled` | `true` | prune old `ghcr.io` versions, never one the chart names or a pod runs; in build only mode see Notes |
 | `cleanup_keep` | `3` | versions to keep per image |
@@ -217,6 +218,13 @@ in the caller keeps one branch in order.
 `sync` calls the REST API of `argocd_server` over HTTPS with `curl`; it downloads and runs
 nothing from that host. The Application needs the labels `app`, `env` and `team`, or its
 name in `argocd_app`.
+
+For a frontend-only rollout in a shared Application, pass one frontend component,
+`argocd_app`, and the literal `argocd_deployment` name. The Application must use one
+source and manual sync. The job sends only that namespaced `apps/Deployment` at the
+chart commit it pushed, without pruning; it waits for that Deployment to roll out
+the built image tag, not for unrelated resources to become healthy. This selector
+limits this workflow's sync request; it does not change Argo CD RBAC.
 
 ### Vault
 

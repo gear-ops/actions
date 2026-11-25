@@ -119,6 +119,10 @@ on:
         description: "Application name (default: by labels app/env/team)"
         type: string
         default: ""
+      argocd_deployment:
+        description: "Sync only this existing apps/Deployment in the Application destination namespace; requires an explicit app and one chart component"
+        type: string
+        default: ""
       argocd_timeout:
         description: "Seconds to wait for sync + health"
         type: number
@@ -255,6 +259,8 @@ jobs:
           IN_CHARTS_REPO: ${{ inputs.charts_repo }}
           IN_VALUES_PATH: ${{ inputs.charts_values_path }}
           IN_ARGOCD_SERVER: ${{ inputs.argocd_server }}
+          DEPLOYMENT: ${{ inputs.argocd_deployment }}
+          ARGO_APP: ${{ inputs.argocd_app }}
           IN_VAULT_SERVER: ${{ inputs.vault_server }}
           IN_VAULT_ROLE: ${{ inputs.vault_role }}
           IN_VAULT_AUTH_PATH: ${{ inputs.vault_auth_path }}
@@ -323,6 +329,12 @@ jobs:
           yq -o=json '.' <<< "$COMPONENTS" > "$comp"
           n=$(jq 'length' "$comp")
           [[ "$n" -gt 0 ]] || { echo "::error::inputs.components is empty"; exit 1; }
+          if [[ -n "$DEPLOYMENT" ]]; then
+            [[ "$DEPLOYMENT" =~ ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$ && -n "$(strip "$ARGO_APP")" && -n "$(strip "$IN_CHARTS_REPO")" && -n "$(strip "$IN_ARGOCD_SERVER")" ]] ||
+              { echo "::error::scoped sync requires a literal Deployment name, argocd_app, charts_repo and argocd_server"; exit 1; }
+            jq -e 'length == 1 and (.[0].chart_components_extra // "") == ""' "$comp" >/dev/null ||
+              { echo "::error::scoped sync requires exactly one chart component with no extra components"; exit 1; }
+          fi
           dup=$(jq -r '[.[].name] | group_by(.) | map(select(length>1)[0]) | join(", ")' "$comp")
           [[ -z "$dup" ]] || { echo "::error::duplicate component names: ${dup}"; exit 1; }
 
@@ -436,6 +448,7 @@ jobs:
         env:
           ARGOCD_SERVER: ${{ inputs.argocd_server }}
           APP_OVERRIDE: ${{ inputs.argocd_app }}
+          DEPLOYMENT: ${{ inputs.argocd_deployment }}
           CHARTS_REPO: ${{ inputs.charts_repo }}
           APP_NAME: ${{ inputs.app }}
           TEAM: ${{ inputs.team }}
@@ -454,6 +467,16 @@ jobs:
           [[ -n "${ARGOCD_AUTH_TOKEN:-}" ]] || { echo "::error::argocd_server is set but ARGOCD_AUTH_TOKEN is in neither Vault <vault_mount_ci>/ci/shared nor the secret"; exit 1; }
           if [[ -n "$APP_OVERRIDE" ]]; then
             [[ "$APP_OVERRIDE" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]] || { echo "::error::argocd_app '${APP_OVERRIDE}' is not an Application name"; exit 1; }
+            if [[ -n "$DEPLOYMENT" ]]; then
+              # A chart push alone can trigger a full rollout if automated sync is enabled.
+              curl -fsS -H "Authorization: Bearer $ARGOCD_AUTH_TOKEN" "https://${ARGOCD_SERVER}/api/v1/applications/${APP_OVERRIDE}" |
+                jq -e --arg name "$DEPLOYMENT" '
+                  (.spec.syncPolicy.automated == null or .spec.syncPolicy.automated.enabled == false) and
+                  (.spec.sources | length == 0) and
+                  (.spec.destination.namespace as $ns | ($ns | type == "string" and length > 0) and
+                   ([.status.resources[] | select(.group == "apps" and .kind == "Deployment" and .namespace == $ns and .name == $name)] | length == 1))' >/dev/null ||
+                { echo "::error::expected a single-source, manual-sync app with the named Deployment in its destination namespace"; exit 1; }
+            fi
             echo "▸ explicit argocd_app='${APP_OVERRIDE}'"; emit true 1 "$APP_OVERRIDE"; exit 0
           fi
 
@@ -787,6 +810,7 @@ jobs:
       bumped: ${{ steps.bump.outputs.bumped }}
       image_refs: ${{ steps.bump.outputs.image_refs }}
       image_refs_count: ${{ steps.bump.outputs.image_refs_count }}
+      revision: ${{ steps.revision.outputs.sha }}
     steps:
       - name: Read CI credentials from Vault
         env:
@@ -971,6 +995,12 @@ jobs:
           done
           echo "::error::could not push the bump commit after 5 attempts"; exit 1
 
+      - name: Record scoped sync revision
+        if: ${{ inputs.argocd_deployment != '' }}
+        id: revision
+        working-directory: gitops
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   sync:
     needs: [plan, bump]
     if: ${{ !cancelled() && inputs.argocd_server != '' && needs.bump.result == 'success' && needs.plan.outputs.apps != '' }}
@@ -1033,6 +1063,9 @@ jobs:
           APP_NAME: ${{ inputs.app }}
           TEAM: ${{ inputs.team }}
           TIMEOUT: ${{ inputs.argocd_timeout }}
+          DEPLOYMENT: ${{ inputs.argocd_deployment }}
+          REVISION: ${{ needs.bump.outputs.revision }}
+          IMAGE: ${{ fromJSON(needs.plan.outputs.matrix)[0].docker_image }}
         run: |
           set -euo pipefail
           strip() { printf '%s' "${1-}" | tr -d '[:space:]'; }
@@ -1051,8 +1084,16 @@ jobs:
             local app=$1 st prev deadline err started phase left sync health seen=""
             st=$(api GET "applications/${app}") || return 1
             prev=$(jq -r '.status.operationState.startedAt // ""' <<< "$st")
+            local body='{}' namespace manifest
+            if [[ -n "$DEPLOYMENT" ]]; then
+              [[ "$REVISION" =~ ^[0-9a-f]{40}$ && -n "$IMAGE" ]] || return 1
+              namespace=$(jq -er 'select(.spec.syncPolicy.automated == null or .spec.syncPolicy.automated.enabled == false) | .spec.destination.namespace | select(type == "string" and length > 0)' <<< "$st") || return 1
+              body=$(jq -cn --arg namespace "$namespace" --arg name "$DEPLOYMENT" --arg revision "$REVISION" \
+                '{revision:$revision,prune:false,resources:[{group:"apps",kind:"Deployment",namespace:$namespace,name:$name}]}') || return 1
+            fi
             deadline=$((SECONDS + TIMEOUT))
-            until err=$(api POST "applications/${app}/sync" '{}' 2>&1 >/dev/null); do
+            until err=$(api POST "applications/${app}/sync" "$body" 2>&1 >/dev/null); do
+              if [[ -n "$DEPLOYMENT" ]]; then echo "$err"; return 1; fi
               if [[ "$err" != *"another operation is already in progress"* ]] || (( SECONDS >= deadline )); then echo "$err"; return 1; fi
               sleep 5
             done
@@ -1061,7 +1102,12 @@ jobs:
               started=$(jq -r '.status.operationState.startedAt // ""' <<< "$st"); phase=$(jq -r '.status.operationState.phase // ""' <<< "$st")
               if [[ "$started" != "$prev" ]]; then
                 case "$phase" in
-                  Succeeded) break ;;
+                  Succeeded)
+                    if [[ -n "$DEPLOYMENT" ]]; then
+                      jq -e --argjson req "$body" '.status.operationState as $op |
+                        $op.syncResult.revision == $req.revision and $op.operation.sync.resources == $req.resources' <<< "$st" >/dev/null || return 1
+                    fi
+                    break ;;
                   Failed|Error) echo "sync ${phase}: $(jq -r '.status.operationState.message // ""' <<< "$st")"; return 1 ;;
                 esac
               fi
@@ -1073,6 +1119,18 @@ jobs:
             [[ -z "$left" ]] || { echo "left in the cluster though the chart no longer has them — prune or delete: ${left}"; return 1; }
             deadline=$((SECONDS + TIMEOUT))
             while :; do
+              if [[ -n "$DEPLOYMENT" ]]; then
+                manifest=$(api GET "applications/${app}/resource?namespace=${namespace}&resourceName=${DEPLOYMENT}&group=apps&version=v1&kind=Deployment") || return 1
+                if jq -e --arg name "$DEPLOYMENT" --arg ns "$namespace" --arg img "$IMAGE" '.manifest | fromjson | (.spec.replicas // 1) as $n |
+                  .metadata.name == $name and .metadata.namespace == $ns and
+                  any(.spec.template.spec.containers[]; .image == $img) and
+                  .metadata.generation > 0 and .status.observedGeneration == .metadata.generation and
+                  $n > 0 and .status.replicas == $n and .status.updatedReplicas == $n and .status.availableReplicas == $n' <<< "$manifest" >/dev/null; then
+                  echo "rolled out Deployment ${namespace}/${DEPLOYMENT}: ${IMAGE}"; return 0
+                fi
+                (( SECONDS < deadline )) || { echo "Deployment ${namespace}/${DEPLOYMENT} did not roll out"; return 1; }
+                sleep 5; continue
+              fi
               st=$(api GET "applications/${app}") || return 1
               if [[ "$(jq -r '(.status.reconciledAt // "") >= (.status.operationState.finishedAt // "~")' <<< "$st")" == "true" ]]; then
                 sync=$(jq -r '.status.sync.status // "Unknown"' <<< "$st"); health=$(jq -r '.status.health.status // "Unknown"' <<< "$st")
